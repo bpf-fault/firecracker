@@ -3,10 +3,12 @@
 
 //! Defines state structures for saving/restoring a Firecracker microVM.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::forget;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -37,11 +39,12 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemory, GuestMemoryExtension, GuestMemoryState, GuestRegionMmap, GuestRegionType,
+    MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
-use crate::{EventManager, Vmm, vstate};
+use crate::{EventManager, Vmm, VmmError, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -144,6 +147,16 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
+    /// Failed to create userfaultfd (live snapshots require Linux >= 5.7 with WP support): {0}
+    UffdCreate(userfaultfd::Error),
+    /// Failed to register memory with userfaultfd: {0}
+    UffdRegister(userfaultfd::Error),
+    /// Failed to write-protect memory via userfaultfd: {0}
+    UffdWriteProtect(userfaultfd::Error),
+    /// Failed to read userfaultfd event: {0}
+    UffdReadEvent(userfaultfd::Error),
+    /// VMM error during live snapshot: {0}
+    VmmError(VmmError),
 }
 
 /// Snapshot version
@@ -170,6 +183,391 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(vmm.vm.guest_memory());
 
+    Ok(())
+}
+
+/// Information about a registered UFFD memory region, used for cleanup.
+struct UffdRegion {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+/// RAII guard that ensures the VM is left in a consistent running state
+/// even if the live snapshot fails partway through.
+struct LiveSnapshotGuard<'a> {
+    vmm: &'a mut Vmm,
+    uffd: Option<Uffd>,
+    regions: Vec<UffdRegion>,
+    paused: bool,
+    devices_kicked: bool,
+}
+
+impl<'a> LiveSnapshotGuard<'a> {
+    fn new(vmm: &'a mut Vmm) -> Self {
+        Self {
+            vmm,
+            uffd: None,
+            regions: Vec::new(),
+            paused: false,
+            devices_kicked: false,
+        }
+    }
+}
+
+impl Drop for LiveSnapshotGuard<'_> {
+    fn drop(&mut self) {
+        // Remove write-protection and unregister all regions from UFFD.
+        if let Some(ref uffd) = self.uffd {
+            for region in &self.regions {
+                if let Err(err) = uffd.remove_write_protection(region.ptr, region.len, true) {
+                    warn!(
+                        "LiveSnapshotGuard: failed to remove write-protection \
+                         at {:?} len {}: {}",
+                        region.ptr, region.len, err
+                    );
+                }
+            }
+            for region in &self.regions {
+                if let Err(err) = uffd.unregister(region.ptr, region.len) {
+                    warn!(
+                        "LiveSnapshotGuard: failed to unregister UFFD region \
+                         at {:?} len {}: {}",
+                        region.ptr, region.len, err
+                    );
+                }
+            }
+        }
+        // Resume VM if still paused.
+        if self.paused
+            && let Err(err) = self.vmm.resume_vcpus_only()
+        {
+            warn!("LiveSnapshotGuard: failed to resume vCPUs: {}", err);
+        }
+        // Kick devices if not yet done.
+        if !self.devices_kicked {
+            self.vmm.kick_devices();
+        }
+    }
+}
+
+/// Registers a memory range with the UFFD in write-protect mode.
+fn uffd_register_wp(
+    uffd: &Uffd,
+    start: *mut libc::c_void,
+    len: usize,
+) -> Result<(), userfaultfd::Error> {
+    use userfaultfd::RegisterMode;
+    // Register with both MISSING and WP modes so that WP faults are reported.
+    let mode = RegisterMode::MISSING | RegisterMode::WRITE_PROTECT;
+    uffd.register_with_mode(start, len, mode)?;
+    Ok(())
+}
+
+/// Page tracking entry for the live snapshot streaming phase.
+struct PageEntry {
+    /// Host pointer to the start of this page.
+    ptr: *const u8,
+    /// File offset where this page should be written.
+    file_offset: u64,
+    /// Size of this page.
+    size: usize,
+    /// Whether this page has been saved to the output file.
+    saved: bool,
+}
+
+/// Creates a live snapshot of the microVM.
+///
+/// The VM is paused only briefly to save device/vCPU state and enable
+/// write-protection. Memory is then streamed to the output file while
+/// the VM continues running. Writes to not-yet-saved pages are trapped
+/// via userfaultfd write-protect and saved before unblocking the vCPU.
+pub fn create_live_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
+    let page_size = vm_info.huge_pages.page_size();
+    let t_start = std::time::Instant::now();
+
+    // === Phase 1: PREPARE (VM still running) ===
+    info!("Live snapshot: Phase 1 - Prepare");
+
+    // Populate all RAM pages so PTEs exist (UFFDIO_WRITEPROTECT skips missing PTEs).
+    let t_populate_start = std::time::Instant::now();
+    vmm.vm.guest_memory().populate_pages(page_size);
+    info!(
+        "Live snapshot: populate_pages took {} us",
+        t_populate_start.elapsed().as_micros()
+    );
+
+    // Open/truncate memory output file.
+    let mut mem_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(true)
+        .open(&params.mem_file_path)
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("open", err))?;
+
+    // Calculate total guest memory size for the file.
+    let total_mem_size: u64 = vmm
+        .vm
+        .guest_memory()
+        .iter()
+        .flat_map(|region| region.slots())
+        .map(|(slot, _)| slot.slice.len() as u64)
+        .sum();
+    mem_file
+        .set_len(total_mem_size)
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("set_len", err))?;
+
+    // Create UFFD with WP support.
+    let uffd = UffdBuilder::new()
+        .require_features(FeatureFlags::PAGEFAULT_FLAG_WP | FeatureFlags::EVENT_REMOVE)
+        .close_on_exec(true)
+        .non_blocking(true)
+        .user_mode_only(false)
+        .create()
+        .map_err(CreateSnapshotError::UffdCreate)?;
+
+    // Set up RAII guard for cleanup. From this point on, all access to vmm goes
+    // through guard.vmm (which holds the mutable borrow).
+    let mut guard = LiveSnapshotGuard::new(vmm);
+    guard.uffd = Some(uffd);
+
+    // === Phase 2: FREEZE (brief pause) ===
+    let t_phase1 = t_start.elapsed();
+    info!(
+        "Live snapshot: Phase 1 took {} us",
+        t_phase1.as_micros()
+    );
+    info!("Live snapshot: Phase 2 - Freeze");
+    let t_freeze_start = std::time::Instant::now();
+
+    guard
+        .vmm
+        .pause_vm()
+        .map_err(CreateSnapshotError::VmmError)?;
+    guard.paused = true;
+    let t_after_pause = t_freeze_start.elapsed();
+
+    // Save device + vCPU + KVM state.
+    let microvm_state = guard
+        .vmm
+        .save_state(vm_info)
+        .map_err(CreateSnapshotError::MicrovmState)?;
+    let t_after_save_state = t_freeze_start.elapsed();
+
+    // Register all plugged slots with UFFD in WP mode and enable write-protection.
+    let uffd_ref = guard.uffd.as_ref().expect("uffd was just created");
+
+    // guest_memory() returns a &GuestMemoryMmap (not an Arc), so the borrow cannot
+    // be held across mutable borrows of guard.vmm (pause/resume). We re-bind it in
+    // each phase where it's needed; the underlying data is the same throughout.
+    {
+        let guest_memory = guard.vmm.vm.guest_memory();
+        for region in guest_memory.iter() {
+            for slot in region.plugged_slots() {
+                let ptr = slot.slice.ptr_guard().as_ptr() as *mut libc::c_void;
+                let len = slot.slice.len();
+                uffd_register_wp(uffd_ref, ptr, len)
+                    .map_err(CreateSnapshotError::UffdRegister)?;
+                uffd_ref
+                    .write_protect(ptr, len)
+                    .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                guard.regions.push(UffdRegion { ptr, len });
+            }
+        }
+    }
+    let t_after_wp = t_freeze_start.elapsed();
+
+    // Resume vCPUs (without kicking devices to avoid deadlock).
+    guard
+        .vmm
+        .resume_vcpus_only()
+        .map_err(CreateSnapshotError::VmmError)?;
+    guard.paused = false;
+    let t_freeze_total = t_freeze_start.elapsed();
+    info!(
+        "Live snapshot: Phase 2 (freeze) took {} us \
+         (pause={} us, save_state={} us, wp_enable={} us, resume={} us)",
+        t_freeze_total.as_micros(),
+        t_after_pause.as_micros(),
+        (t_after_save_state - t_after_pause).as_micros(),
+        (t_after_wp - t_after_save_state).as_micros(),
+        (t_freeze_total - t_after_wp).as_micros(),
+    );
+
+    // === Phase 3: STREAM RAM (VM running) ===
+    info!("Live snapshot: Phase 3 - Stream RAM");
+    let t_stream_start = std::time::Instant::now();
+    let mut fault_pages_saved = 0usize;
+
+    // Build page tracking table.
+    let mut pages: Vec<PageEntry> = Vec::new();
+    let mut file_offset: u64 = 0;
+    let guest_memory = guard.vmm.vm.guest_memory();
+    for region in guest_memory.iter() {
+        for (slot, plugged) in region.slots() {
+            let slot_len = slot.slice.len();
+            if plugged {
+                let base_ptr = slot.slice.ptr_guard().as_ptr();
+                for off in (0..slot_len).step_by(page_size) {
+                    let actual_size = std::cmp::min(page_size, slot_len - off);
+                    pages.push(PageEntry {
+                        // SAFETY: base_ptr + off is within the guest memory slot.
+                        ptr: unsafe { base_ptr.add(off) },
+                        file_offset: file_offset + off as u64,
+                        size: actual_size,
+                        saved: false,
+                    });
+                }
+            }
+            file_offset += slot_len as u64;
+        }
+    }
+
+    let total_pages = pages.len();
+    let mut saved_count = 0usize;
+    let mut linear_cursor = 0usize;
+
+    // Build index for O(log n) page fault lookup instead of O(n) linear scan.
+    let page_index: BTreeMap<usize, usize> = pages
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.ptr as usize, i))
+        .collect();
+
+    while saved_count < total_pages {
+        // Non-blocking check for WP faults.
+        let uffd_ref = guard.uffd.as_ref().expect("uffd exists");
+        match uffd_ref.read_event() {
+            Ok(Some(userfaultfd::Event::Pagefault { addr, .. })) => {
+                // Find and save the faulted page using BTreeMap for O(log n) lookup.
+                let fault_addr = addr as usize;
+                if let Some((&page_start, &idx)) =
+                    page_index.range(..=fault_addr).next_back()
+                {
+                    let page = &mut pages[idx];
+                    if !page.saved && fault_addr < page_start + page.size {
+                        save_page(&mut mem_file, page)?;
+                        page.saved = true;
+                        saved_count += 1;
+                        fault_pages_saved += 1;
+
+                        // Remove write-protection (unblocks the faulting vCPU).
+                        let page_ptr = page.ptr as *mut libc::c_void;
+                        uffd_ref
+                            .remove_write_protection(page_ptr, page.size, true)
+                            .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                    }
+                }
+            }
+            Ok(Some(userfaultfd::Event::Remove { start, end })) => {
+                // Balloon removed pages via madvise(MADV_DONTNEED).
+                // Use BTreeMap range query to find only affected pages.
+                let start_addr = start as usize;
+                let end_addr = end as usize;
+                for (&page_start, &idx) in page_index.range(start_addr..end_addr) {
+                    let page = &mut pages[idx];
+                    if !page.saved && page_start >= start_addr && page_start < end_addr {
+                        // File is sparse — unwritten regions are already zero.
+                        page.saved = true;
+                        saved_count += 1;
+                    }
+                }
+            }
+            Ok(None) => {
+                // No fault pending — save the next unsaved page from the linear scan.
+                while linear_cursor < total_pages && pages[linear_cursor].saved {
+                    linear_cursor += 1;
+                }
+
+                if linear_cursor < total_pages {
+                    let page = &mut pages[linear_cursor];
+                    save_page(&mut mem_file, page)?;
+                    page.saved = true;
+                    saved_count += 1;
+
+                    // Remove write-protection for this page.
+                    let page_ptr = page.ptr as *mut libc::c_void;
+                    uffd_ref
+                        .remove_write_protection(page_ptr, page.size, true)
+                        .map_err(CreateSnapshotError::UffdWriteProtect)?;
+
+                    linear_cursor += 1;
+                }
+            }
+            Ok(Some(_)) => {
+                // Other events (Fork, Remap, Unmap) — ignore.
+            }
+            Err(err) => {
+                return Err(CreateSnapshotError::UffdReadEvent(err));
+            }
+        }
+    }
+
+    // === Phase 4: FINALIZE ===
+    let t_stream_total = t_stream_start.elapsed();
+    info!(
+        "Live snapshot: Phase 3 (stream) took {} us, {} pages total \
+         ({} fault-driven, {} linear-scan)",
+        t_stream_total.as_micros(),
+        total_pages,
+        fault_pages_saved,
+        total_pages - fault_pages_saved,
+    );
+    info!("Live snapshot: Phase 4 - Finalize");
+    let t_finalize_start = std::time::Instant::now();
+
+    // Kick devices (deferred from resume).
+    //
+    // Note: unlike create_snapshot(), we do NOT call mark_virtio_queue_memory_dirty() here.
+    // Full/diff snapshots need it because they only dump dirty pages and might miss queue
+    // memory that was modified outside the dirty-tracking path. Live snapshots dump ALL
+    // guest memory pages, so virtio queue contents are captured as part of the streaming
+    // loop. On restore, the canonical device/queue state comes from the snapshot file
+    // (saved during Phase 2), not from the memory file, so any queue-page writes that
+    // occurred between Phase 2 and Phase 3 page save are harmless.
+    guard.vmm.kick_devices();
+    guard.devices_kicked = true;
+
+    // Unregister all memory from UFFD and drop it.
+    if let Some(ref uffd) = guard.uffd {
+        for region in &guard.regions {
+            let _ = uffd.unregister(region.ptr, region.len);
+        }
+    }
+    guard.regions.clear();
+    guard.uffd = None;
+
+    // Write device state to snapshot file.
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+
+    // Sync memory file.
+    mem_file
+        .sync_all()
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))?;
+
+    let t_total = t_start.elapsed();
+    info!(
+        "Live snapshot: Phase 4 (finalize) took {} us",
+        t_finalize_start.elapsed().as_micros()
+    );
+    info!(
+        "Live snapshot: complete in {} us (freeze/downtime={} us)",
+        t_total.as_micros(),
+        t_freeze_total.as_micros(),
+    );
+    Ok(())
+}
+
+/// Saves a single page to the memory file at the correct offset.
+fn save_page(file: &File, page: &PageEntry) -> Result<(), CreateSnapshotError> {
+    // SAFETY: page.ptr points to valid guest memory of page.size bytes.
+    let data = unsafe { std::slice::from_raw_parts(page.ptr, page.size) };
+    file.write_all_at(data, page.file_offset)
+        .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
     Ok(())
 }
 
@@ -477,13 +875,13 @@ fn guest_memory_from_file(
 pub enum GuestMemoryFromUffdError {
     /// Failed to restore guest memory: {0}
     Restore(#[from] MemoryError),
-    /// Failed to UFFD object: {0}
+    /// Failed to create UFFD object: {0}
     Create(userfaultfd::Error),
     /// Failed to register memory address range with the userfaultfd object: {0}
     Register(userfaultfd::Error),
     /// Failed to connect to UDS Unix stream: {0}
     Connect(#[from] std::io::Error),
-    /// Failed to sends file descriptor: {0}
+    /// Failed to send file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
 }
 

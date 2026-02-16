@@ -18,6 +18,8 @@ pub enum SnapshotType {
     /// Full snapshot.
     #[default]
     Full,
+    /// Live snapshot (VM continues running during memory dump).
+    Live,
 }
 
 /// Specifies the method through which guest memory will get populated when

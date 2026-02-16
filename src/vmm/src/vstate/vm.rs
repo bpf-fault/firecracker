@@ -385,6 +385,11 @@ impl Vm {
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
             }
+            SnapshotType::Live => {
+                // Live snapshots handle memory streaming separately via
+                // create_live_snapshot(); this path should never be reached.
+                unreachable!("Live snapshots do not use snapshot_memory_to_file");
+            }
         };
 
         file.flush()

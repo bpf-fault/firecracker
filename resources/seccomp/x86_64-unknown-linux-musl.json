@@ -29,6 +29,10 @@
                 "syscall": "write"
             },
             {
+                "syscall": "pwrite64",
+                "comment": "Used by live snapshot to write pages at offset (pwrite)"
+            },
+            {
                 "syscall": "mincore"
             },
             {
@@ -496,6 +500,75 @@
             {
                 "syscall": "mprotect",
                 "comment": "Used by memory hotplug to protect access to underlying host memory"
+            },
+            {
+                "syscall": "userfaultfd",
+                "comment": "Used by live snapshot to create a userfaultfd for write-protect tracking (fallback when /dev/userfaultfd is absent)"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "USERFAULTFD_IOC_NEW, used by live snapshot to create userfaultfd via /dev/userfaultfd",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 43520,
+                        "comment": "USERFAULTFD_IOC_NEW = 0x0000AA00"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "UFFDIO_API, used by live snapshot to initialize userfaultfd",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3222841919,
+                        "comment": "UFFDIO_API = 0xC018AA3F"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "UFFDIO_REGISTER, used by live snapshot to register guest memory with userfaultfd",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3223366144,
+                        "comment": "UFFDIO_REGISTER = 0xC020AA00"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "UFFDIO_UNREGISTER, used by live snapshot to unregister guest memory from userfaultfd",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2148575745,
+                        "comment": "UFFDIO_UNREGISTER = 0x8010AA01"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "UFFDIO_WRITEPROTECT, used by live snapshot to enable/disable write protection",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3222841862,
+                        "comment": "UFFDIO_WRITEPROTECT = 0xC018AA06"
+                    }
+                ]
             }
         ]
     },

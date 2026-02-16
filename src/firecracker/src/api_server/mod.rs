@@ -158,6 +158,10 @@ impl ApiServer {
                     &METRICS.latencies_us.diff_create_snapshot,
                     "create diff snapshot",
                 )),
+                SnapshotType::Live => Some((
+                    &METRICS.latencies_us.vmm_live_create_snapshot,
+                    "create live snapshot",
+                )),
             },
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))
