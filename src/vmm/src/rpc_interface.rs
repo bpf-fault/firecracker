@@ -8,7 +8,7 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{create_live_snapshot, create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -28,7 +28,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
@@ -859,28 +859,48 @@ impl RuntimeApiController {
         let vm_info = VmInfo::from(&self.vm_resources);
         let create_start_us = get_time_us(ClockType::Monotonic);
 
-        create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
-
         match create_params.snapshot_type {
-            SnapshotType::Full => {
+            SnapshotType::Live => {
+                if locked_vmm.instance_info.state != VmState::Running {
+                    return Err(VmmActionError::CreateSnapshot(
+                        CreateSnapshotError::VmmError(VmmError::VcpuPause),
+                    ));
+                }
+                create_live_snapshot(&mut locked_vmm, &vm_info, create_params)?;
                 let elapsed_time_us = update_metric_with_elapsed_time(
-                    &METRICS.latencies_us.vmm_full_create_snapshot,
+                    &METRICS.latencies_us.vmm_live_create_snapshot,
                     create_start_us,
                 );
                 info!(
-                    "'create full snapshot' VMM action took {} us.",
+                    "'create live snapshot' VMM action took {} us.",
                     elapsed_time_us
                 );
             }
-            SnapshotType::Diff => {
-                let elapsed_time_us = update_metric_with_elapsed_time(
-                    &METRICS.latencies_us.vmm_diff_create_snapshot,
-                    create_start_us,
-                );
-                info!(
-                    "'create diff snapshot' VMM action took {} us.",
-                    elapsed_time_us
-                );
+            _ => {
+                create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+                match create_params.snapshot_type {
+                    SnapshotType::Full => {
+                        let elapsed_time_us = update_metric_with_elapsed_time(
+                            &METRICS.latencies_us.vmm_full_create_snapshot,
+                            create_start_us,
+                        );
+                        info!(
+                            "'create full snapshot' VMM action took {} us.",
+                            elapsed_time_us
+                        );
+                    }
+                    SnapshotType::Diff => {
+                        let elapsed_time_us = update_metric_with_elapsed_time(
+                            &METRICS.latencies_us.vmm_diff_create_snapshot,
+                            create_start_us,
+                        );
+                        info!(
+                            "'create diff snapshot' VMM action took {} us.",
+                            elapsed_time_us
+                        );
+                    }
+                    SnapshotType::Live => unreachable!(),
+                }
             }
         }
         Ok(VmmData::Empty)

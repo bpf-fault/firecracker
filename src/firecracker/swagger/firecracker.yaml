@@ -1569,9 +1569,12 @@ definitions:
         enum:
           - Full
           - Diff
+          - Live
         description:
           Type of snapshot to create. It is optional and by default, a full
-          snapshot is created.
+          snapshot is created. Live snapshots capture a point-in-time
+          consistent snapshot with only a brief pause for state save, while
+          the VM continues running during the memory dump phase.
 
   NetworkOverride:
     type: object

@@ -53,6 +53,7 @@ class SnapshotType(Enum):
     FULL = auto()
     DIFF = auto()
     DIFF_MINCORE = auto()
+    LIVE = auto()
 
     def __repr__(self):
         cls_name = self.__class__.__name__
@@ -76,6 +77,8 @@ class SnapshotType(Enum):
                 return "Full"
             case SnapshotType.DIFF | SnapshotType.DIFF_MINCORE:
                 return "Diff"
+            case SnapshotType.LIVE:
+                return "Live"
 
 
 def hardlink_or_copy(src, dst):
@@ -1069,6 +1072,27 @@ class Microvm:
         """Make a Full snapshot"""
         return self.make_snapshot(
             SnapshotType.FULL, mem_path=mem_path, vmstate_path=vmstate_path
+        )
+
+    def snapshot_live(self, *, mem_path: str = "mem", vmstate_path="vmstate"):
+        """Make a Live snapshot (VM is not paused beforehand)"""
+        self.api.snapshot_create.put(
+            mem_file_path=str(mem_path),
+            snapshot_path=str(vmstate_path),
+            snapshot_type="Live",
+        )
+        root = Path(self.chroot())
+        return Snapshot(
+            vmstate=root / vmstate_path,
+            mem=root / mem_path,
+            disks=self.disks,
+            net_ifaces=[x["iface"] for ifname, x in self.iface.items()],
+            ssh_key=self.ssh_key,
+            snapshot_type=SnapshotType.LIVE,
+            meta={
+                "kernel_file": str(self.kernel_file),
+                "vcpus_count": self.vcpus_count,
+            },
         )
 
     def restore_from_snapshot(

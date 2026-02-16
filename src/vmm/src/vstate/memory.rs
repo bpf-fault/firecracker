@@ -582,6 +582,12 @@ where
 
     /// Discards a memory range, freeing up memory pages
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
+
+    /// Touches one byte per page to ensure all PTEs exist.
+    ///
+    /// This is necessary before enabling UFFD write-protection, because
+    /// `UFFDIO_WRITEPROTECT` silently skips pages with no PTE.
+    fn populate_pages(&self, page_size: usize);
 }
 
 /// State of a guest memory region saved to file/buffer.
@@ -758,6 +764,24 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
             region.discard_range(start, len)
         })
+    }
+
+    fn populate_pages(&self, page_size: usize) {
+        for region in self.iter() {
+            for slot in region.plugged_slots() {
+                let ptr = slot.slice.ptr_guard().as_ptr();
+                let len = slot.slice.len();
+
+                for offset in (0..len).step_by(page_size) {
+                    // SAFETY: ptr+offset is within the mapped guest memory region,
+                    // which is guaranteed by the plugged_slots iterator and the
+                    // offset being bounded by len.
+                    unsafe {
+                        std::ptr::read_volatile(ptr.add(offset));
+                    }
+                }
+            }
+        }
     }
 }
 

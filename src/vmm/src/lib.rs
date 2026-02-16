@@ -375,17 +375,17 @@ impl Vmm {
         Ok(())
     }
 
-    /// Sends a resume command to the vCPUs.
-    pub fn resume_vm(&mut self) -> Result<(), VmmError> {
-        self.device_manager.kick_virtio_devices();
+    /// Sends a resume command to the vCPUs, optionally kicking virtio devices.
+    fn resume_vm_inner(&mut self, kick_devices: bool) -> Result<(), VmmError> {
+        if kick_devices {
+            self.device_manager.kick_virtio_devices();
+        }
 
-        // Send the events.
         self.vcpus_handles
             .iter_mut()
             .try_for_each(|handle| handle.send_event(VcpuEvent::Resume))
             .map_err(|_| VmmError::VcpuMessage)?;
 
-        // Check the responses.
         if self
             .vcpus_handles
             .iter()
@@ -397,6 +397,28 @@ impl Vmm {
 
         self.instance_info.state = VmState::Running;
         Ok(())
+    }
+
+    /// Sends a resume command to the vCPUs.
+    pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        self.resume_vm_inner(true)
+    }
+
+    /// Resumes vCPUs without kicking virtio devices.
+    ///
+    /// This is used by live snapshots to avoid the VMM thread writing to
+    /// write-protected guest memory (which would deadlock). Device kicks are
+    /// deferred until after write-protection is removed.
+    pub fn resume_vcpus_only(&mut self) -> Result<(), VmmError> {
+        self.resume_vm_inner(false)
+    }
+
+    /// Kicks all virtio devices as if they had external events.
+    ///
+    /// This is called after live snapshot completion once write-protection
+    /// has been removed, to process any deferred device work.
+    pub fn kick_devices(&self) {
+        self.device_manager.kick_virtio_devices();
     }
 
     /// Sends a pause command to the vCPUs.
