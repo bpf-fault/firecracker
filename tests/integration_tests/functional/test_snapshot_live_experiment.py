@@ -42,7 +42,13 @@ WORKLOAD_PARAMS = {
 
 RESULTS_FILE = os.environ.get(
     "EXPERIMENT_RESULTS_CSV",
-    "/tmp/experiment_results.csv",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))),
+        "test_results",
+        "experiment_results.csv",
+    ),
 )
 
 CSV_FIELDS = [
@@ -673,9 +679,26 @@ def test_snapshot_experiment_quick(
     _write_csv_row(full_row)
     _log_summary(full_row)
 
-    # Restore from the full snapshot to get a fresh running VM for the live
-    # snapshot (the original was paused by the full snapshot).
-    vm_live, _ = _do_restore_timed(microvm_factory, full_row["_snapshot"])
+    # Boot a fresh VM for the live snapshot path.
+    # We cannot reuse the full-snapshot VM (it's paused) or a restored VM
+    # (file-backed memory doesn't support UFFD-WP on kernel < 6.x).
+    vm_live = microvm_factory.build(
+        kernel=vm_full.kernel_file,
+        rootfs=vm_full.rootfs_file,
+    )
+    vm_live.monitors = [m for m in vm_live.monitors if m is not vm_live.memory_monitor]
+    vm_live.memory_monitor = None
+    vm_live.spawn()
+    vm_live.basic_config(vcpu_count=VCPU_COUNT, mem_size_mib=mem_size_mib)
+    vm_live.add_net_iface()
+    vm_live.start()
+    vm_live.ssh.check_output("true")
+    # Condition memory.
+    prefill_mib = max(mem_size_mib // 4, 16)
+    vm_live.ssh.check_output(
+        f"head -c {prefill_mib}M /dev/urandom > /tmp/prefill 2>/dev/null; sync",
+        timeout=120,
+    )
 
     live_row = _run_live_snapshot(
         vm_live, microvm_factory, mem_size_mib, workload, iteration=0
