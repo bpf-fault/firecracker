@@ -772,6 +772,22 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 let ptr = slot.slice.ptr_guard().as_ptr();
                 let len = slot.slice.len();
 
+                // Try madvise(MADV_POPULATE_READ) first (Linux 5.14+).
+                // This populates all PTEs in a single syscall instead of
+                // faulting each page individually.
+                // SAFETY: ptr..ptr+len is a valid mapped guest memory region.
+                let ret = unsafe {
+                    libc::madvise(
+                        ptr as *mut libc::c_void,
+                        len,
+                        libc::MADV_POPULATE_READ,
+                    )
+                };
+                if ret == 0 {
+                    continue;
+                }
+
+                // Fallback for older kernels (< 5.14): touch each page.
                 for offset in (0..len).step_by(page_size) {
                     // SAFETY: ptr+offset is within the mapped guest memory region,
                     // which is guaranteed by the plugged_slots iterator and the
