@@ -478,25 +478,58 @@ pub fn create_live_snapshot(
                 }
             }
             Ok(None) => {
-                // No fault pending — save the next unsaved page from the linear scan.
+                // No fault pending — save a batch of consecutive unsaved pages.
+                // Batching amortizes syscall overhead: one pwrite + one
+                // UFFDIO_WRITEPROTECT ioctl per batch instead of per page.
+                const BATCH_SIZE: usize = 64;
+
                 while linear_cursor < total_pages && pages[linear_cursor].saved {
                     linear_cursor += 1;
                 }
 
-                if linear_cursor < total_pages {
-                    let page = &mut pages[linear_cursor];
-                    save_page(&mut mem_file, page)?;
-                    page.saved = true;
+                let batch_start = linear_cursor;
+                let mut batch_end = linear_cursor;
+                while batch_end < total_pages
+                    && batch_end - batch_start < BATCH_SIZE
+                    && !pages[batch_end].saved
+                {
+                    // Check pages are contiguous in host virtual address space.
+                    if batch_end > batch_start {
+                        let prev = &pages[batch_end - 1];
+                        let curr = &pages[batch_end];
+                        if curr.ptr as usize != prev.ptr as usize + prev.size {
+                            break;
+                        }
+                    }
+                    pages[batch_end].saved = true;
                     saved_count += 1;
-
-                    // Remove write-protection for this page.
-                    let page_ptr = page.ptr as *mut libc::c_void;
-                    uffd_ref
-                        .remove_write_protection(page_ptr, page.size, true)
-                        .map_err(CreateSnapshotError::UffdWriteProtect)?;
-
-                    linear_cursor += 1;
+                    batch_end += 1;
                 }
+
+                // Write the entire contiguous batch in a single pwrite syscall
+                // instead of one per page.
+                if batch_end > batch_start {
+                    let first = &pages[batch_start];
+                    let last = &pages[batch_end - 1];
+                    let range_ptr = first.ptr;
+                    let range_len = (last.ptr as usize + last.size) - first.ptr as usize;
+                    // SAFETY: range_ptr..range_ptr+range_len covers contiguous
+                    // guest memory pages that are write-protected, so their
+                    // content is stable.
+                    let data = unsafe { std::slice::from_raw_parts(range_ptr, range_len) };
+                    mem_file
+                        .write_all_at(data, first.file_offset)
+                        .map_err(|err| {
+                            CreateSnapshotError::MemoryBackingFile("write", err)
+                        })?;
+
+                    // Remove WP for the entire batch in one ioctl.
+                    let range_start = first.ptr as *mut libc::c_void;
+                    uffd_ref
+                        .remove_write_protection(range_start, range_len, true)
+                        .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                }
+                linear_cursor = batch_end;
             }
             Ok(Some(_)) => {
                 // Other events (Fork, Remap, Unmap) — ignore.
