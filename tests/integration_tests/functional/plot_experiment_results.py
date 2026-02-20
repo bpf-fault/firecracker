@@ -35,6 +35,22 @@ WORKLOAD_COLORS = {
 FULL_COLOR = "#9E9E9E"
 LIVE_COLOR = "#2196F3"
 
+# Application workloads (reduced matrix per design doc §6.2)
+APP_MEM_SIZES = [512, 2048]
+APP_WORKLOADS = [
+    "redis_light", "redis_mixed", "redis_heavy",
+    "memcached_light", "memcached_heavy",
+]
+STREAM_KERNELS = ["copy", "scale", "add", "triad"]
+APP_WORKLOAD_COLORS = {
+    "redis_light":       "#B3E5FC",
+    "redis_mixed":       "#0288D1",
+    "redis_heavy":       "#01579B",
+    "memcached_light":   "#C8E6C9",
+    "memcached_heavy":   "#2E7D32",
+    "stream":            "#FF6F00",
+}
+
 
 def _repo_root():
     return os.path.dirname(
@@ -346,6 +362,241 @@ def plot_downtime_vs_wallclock(grouped, outdir):
 
 
 # ---------------------------------------------------------------------------
+# Plot 9: Application ops/sec degradation (live vs full)
+# ---------------------------------------------------------------------------
+
+
+def plot_app_ops_degradation(grouped, outdir):
+    """Grouped bar chart of ops/sec degradation for Redis and Memcached workloads."""
+    # Check whether any app workload data exists.
+    if not any(k[1] in APP_WORKLOADS for k in grouped):
+        print("  Skipping plot 9: no app workload data in CSV")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    n_wl = len(APP_WORKLOADS)
+    n_mem = len(APP_MEM_SIZES)
+    total_bars = n_mem * 2 + 1  # mem sizes × (full + live) + gap
+    width = 0.15
+    x = range(n_wl)
+
+    mem_offsets = {
+        512:  -1.5,
+        2048: -0.5,
+    }
+    # Full snapshot is always 100 % degradation (VM paused).
+    full_offsets = {
+        512:  0.5,
+        2048: 1.5,
+    }
+
+    for i, mem in enumerate(APP_MEM_SIZES):
+        live_vals = []
+        full_vals = []
+        for wl in APP_WORKLOADS:
+            live_rows = grouped.get((mem, wl, "live"), [])
+            live_vals.append(avg([r.get("app_ops_degradation_pct", 0) for r in live_rows]))
+            full_vals.append(100.0)  # full snapshot always 100 % degradation
+
+        color = APP_WORKLOAD_COLORS.get(APP_WORKLOADS[0], "#888888")
+        live_color = list(APP_WORKLOAD_COLORS.values())[i * 2]
+        ax.bar(
+            [xi + mem_offsets[mem] * width for xi in x],
+            live_vals, width,
+            label=f"Live {mem} MiB",
+            color=live_color,
+            edgecolor="white",
+        )
+        ax.bar(
+            [xi + full_offsets[mem] * width for xi in x],
+            full_vals, width,
+            label=f"Full {mem} MiB (always 100%)",
+            color=FULL_COLOR,
+            alpha=0.5,
+            edgecolor="white",
+        )
+
+    ax.set_xlabel("Application Workload", fontsize=12)
+    ax.set_ylabel("Ops/sec Degradation During Snapshot (%)", fontsize=12)
+    ax.set_title("Application Ops/sec Degradation: Full vs Live Snapshot", fontsize=14, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels([w.replace("_", "\n") for w in APP_WORKLOADS], fontsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_ylim(0, 110)
+
+    _savefig(fig, outdir, "09_app_ops_degradation.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 10: Application tail latency (baseline vs during snapshot)
+# ---------------------------------------------------------------------------
+
+
+def plot_app_tail_latency(grouped, outdir):
+    """Grouped bar chart of p99 latency: baseline vs during live snapshot."""
+    if not any(k[1] in APP_WORKLOADS for k in grouped):
+        print("  Skipping plot 10: no app workload data in CSV")
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    x = range(len(APP_WORKLOADS))
+    width = 0.18
+    mem_colors_base  = {512: "#90CAF9", 2048: "#1565C0"}
+    mem_colors_during = {512: "#EF9A9A", 2048: "#B71C1C"}
+
+    for i, mem in enumerate(APP_MEM_SIZES):
+        base_p99   = []
+        during_p99 = []
+        for wl in APP_WORKLOADS:
+            live_rows = grouped.get((mem, wl, "live"), [])
+            base_p99.append(avg([r.get("app_baseline_p99_us", 0) for r in live_rows]))
+            during_p99.append(avg([r.get("app_during_p99_us", 0) for r in live_rows]))
+
+        offset_base   = (-1.5 + i * 2) * width
+        offset_during = (-0.5 + i * 2) * width
+        bars_base = ax.bar(
+            [xi + offset_base for xi in x], base_p99, width,
+            label=f"Baseline {mem} MiB", color=mem_colors_base[mem], edgecolor="white",
+        )
+        bars_during = ax.bar(
+            [xi + offset_during for xi in x], during_p99, width,
+            label=f"During snapshot {mem} MiB", color=mem_colors_during[mem], edgecolor="white",
+        )
+
+        # Annotate spike factor.
+        for xi, b, d in zip(x, base_p99, during_p99):
+            if b > 0 and d > 0:
+                factor = d / b
+                ax.text(
+                    xi + offset_during, d + max(during_p99) * 0.01,
+                    f"×{factor:.1f}", ha="center", va="bottom", fontsize=7,
+                )
+
+    ax.set_xlabel("Application Workload", fontsize=12)
+    ax.set_ylabel("p99 Latency (µs)", fontsize=12)
+    ax.set_title("Application p99 Latency: Baseline vs During Live Snapshot", fontsize=14, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels([w.replace("_", "\n") for w in APP_WORKLOADS], fontsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_ylim(bottom=0)
+
+    _savefig(fig, outdir, "10_app_tail_latency.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 11: STREAM memory bandwidth (baseline vs during snapshot)
+# ---------------------------------------------------------------------------
+
+
+def plot_stream_bandwidth(grouped, outdir):
+    """Grouped bar chart of STREAM kernel bandwidth for 512 and 2048 MiB VMs."""
+    if not any(k[1] == "stream" for k in grouped):
+        print("  Skipping plot 11: no STREAM workload data in CSV")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    n_kernels = len(STREAM_KERNELS)
+    x = range(n_kernels)
+    width = 0.18
+    mem_colors_base   = {512: "#A5D6A7", 2048: "#1B5E20"}
+    mem_colors_during = {512: "#FFCC80", 2048: "#E65100"}
+
+    for i, mem in enumerate(APP_MEM_SIZES):
+        live_rows = grouped.get((mem, "stream", "live"), [])
+        base_vals   = [avg([r.get(f"stream_baseline_{k}_mibs", 0) for r in live_rows]) for k in STREAM_KERNELS]
+        during_vals = [avg([r.get(f"stream_during_{k}_mibs",   0) for r in live_rows]) for k in STREAM_KERNELS]
+
+        offset_base   = (-1.5 + i * 2) * width
+        offset_during = (-0.5 + i * 2) * width
+
+        ax.bar(
+            [xi + offset_base for xi in x], base_vals, width,
+            label=f"Baseline {mem} MiB", color=mem_colors_base[mem], edgecolor="white",
+        )
+        ax.bar(
+            [xi + offset_during for xi in x], during_vals, width,
+            label=f"During snapshot {mem} MiB", color=mem_colors_during[mem], edgecolor="white",
+        )
+
+    ax.set_xlabel("STREAM Kernel", fontsize=12)
+    ax.set_ylabel("Bandwidth (MiB/s)", fontsize=12)
+    ax.set_title("STREAM Benchmark Bandwidth: Baseline vs During Live Snapshot", fontsize=14, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels([k.capitalize() for k in STREAM_KERNELS])
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_ylim(bottom=0)
+
+    _savefig(fig, outdir, "11_stream_bandwidth.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 12: Fault fraction comparison — synthetic, app, and STREAM workloads
+# ---------------------------------------------------------------------------
+
+
+def plot_fault_fraction_comparison(grouped, outdir):
+    """Bar chart comparing fault_fraction_pct across all workload types and memory sizes."""
+    all_workloads = WORKLOADS + APP_WORKLOADS + ["stream"]
+    all_mem = MEM_SIZES  # synthetic uses full matrix; app uses subset
+
+    # Collect only combinations that have data.
+    data_by_wl = {}
+    for wl in all_workloads:
+        per_mem = {}
+        for mem in all_mem:
+            rows = grouped.get((mem, wl, "live"), [])
+            vals = [float(r.get("fault_fraction_pct", 0)) for r in rows if r.get("fault_fraction_pct")]
+            if vals:
+                per_mem[mem] = sum(vals) / len(vals)
+        if per_mem:
+            data_by_wl[wl] = per_mem
+
+    if not data_by_wl:
+        print("  Skipping plot 12: no fault_fraction_pct data in CSV")
+        return
+
+    # Build plot: one group per workload, bars per memory size.
+    present_wls = list(data_by_wl.keys())
+    present_mems = sorted({m for d in data_by_wl.values() for m in d})
+    n_wl = len(present_wls)
+    n_mem = len(present_mems)
+    width = 0.8 / n_mem
+    x = range(n_wl)
+
+    mem_palette = ["#E3F2FD", "#90CAF9", "#42A5F5", "#1E88E5", "#0D47A1"]
+    fig, ax = plt.subplots(figsize=(max(12, n_wl * 1.5), 6))
+
+    for j, mem in enumerate(present_mems):
+        vals = [data_by_wl[wl].get(mem, 0) for wl in present_wls]
+        offset = (j - n_mem / 2 + 0.5) * width
+        color = mem_palette[j % len(mem_palette)]
+        ax.bar(
+            [xi + offset for xi in x], vals, width,
+            label=f"{mem} MiB", color=color, edgecolor="white",
+        )
+
+    ax.set_xlabel("Workload", fontsize=12)
+    ax.set_ylabel("Fault-Driven Page Fraction (%)", fontsize=12)
+    ax.set_title(
+        "Fault-Driven Page Fraction: Synthetic vs Application vs STREAM Workloads",
+        fontsize=13, fontweight="bold",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels([w.replace("_", "\n") for w in present_wls], fontsize=8)
+    ax.legend(title="VM Memory", fontsize=9)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_ylim(bottom=0)
+
+    _savefig(fig, outdir, "12_fault_fraction_all.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -372,9 +623,13 @@ def main():
     plot_phase_breakdown(grouped, outdir)
     plot_freeze_breakdown(grouped, outdir)
     plot_downtime_vs_wallclock(grouped, outdir)
+    plot_app_ops_degradation(grouped, outdir)
+    plot_app_tail_latency(grouped, outdir)
+    plot_stream_bandwidth(grouped, outdir)
+    plot_fault_fraction_comparison(grouped, outdir)
 
     print()
-    print(f"Done! {8} plots saved to {outdir}/")
+    print(f"Done! {12} plots saved to {outdir}/")
 
 
 if __name__ == "__main__":
