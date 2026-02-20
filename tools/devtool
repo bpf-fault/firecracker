@@ -935,7 +935,7 @@ cmd_test() {
     say "$(sed '/^processor.*: 0$/,/^processor.*: 1$/!d; /^processor.*: 1$/d' /proc/cpuinfo)"
     say "RPM firmware versions: $(rpm -q microcode_ctl amd-ucode-firmware linux-firmware)"
 
-    env |grep -P "^(AWS_EMF_|BUILDKITE|CODECOV_)" > env.list
+    env |grep -P "^(AWS_EMF_|BUILDKITE|CODECOV_|EXPERIMENT_)" > env.list
     if [[ $performance_tweaks -eq 1 ]]; then
       if [[ "$(uname --machine)" == "x86_64" ]]; then
         say "Detected CI and performance tests, tuning CPU frequency scaling and idle states for reduced variability"
