@@ -304,7 +304,8 @@ memcached -d -m $MEMCACHED_MEM -t 2 -u root -p 11211
 
 ```bash
 # Pre-populate with memtier_benchmark
-memtier_benchmark -s 127.0.0.1 -p 11211 -P memcache_binary \
+# --key-maximum is required with -n allkeys; without it memtier exits non-zero.
+memtier_benchmark -p 11211 --protocol=memcache_text \
     --key-maximum=500000 --data-size=512 \
     --ratio=1:0 -n allkeys -c 10 --hide-histogram -q
 ```
@@ -805,34 +806,52 @@ For each (memory_size, workload) pair, compute across 10 iterations:
 
 ## 11. Running the Experiment
 
+All commands in this section are run from the repository root on the
+host machine. Tests execute inside a Docker container managed by
+`./tools/devtool`; the repo is bind-mounted at `/firecracker` inside
+the container.
+
 ### 11.1 Prerequisites
 
+**Host requirements:**
+
 ```bash
-# Build release binary
+# 1. Build the release Firecracker binary (used by all tests)
 ./tools/devtool build --release
 
-# Verify UFFD-WP support (kernel >= 5.7)
-uname -r  # Should be >= 5.7
+# 2. Verify UFFD write-protect support (kernel >= 5.7 required)
+uname -r   # must be >= 5.7; experiment was validated on 5.15
 
-# Ensure sufficient host memory (need ~2x largest VM size)
-free -h   # Need at least 10 GiB free for 4096 MiB VM tests
+# 3. Check available host memory
+free -h    # need >= 2x the largest VM size tested
+           # >= 10 GiB free for 4096 MiB VM tests
 ```
 
-**Additional prerequisites for application workloads:**
+**Application workload prerequisites (Redis, Memcached, STREAM):**
 
-The application workload tests require a custom guest rootfs with Redis,
-Memcached, memtier_benchmark, and STREAM pre-installed. Build one from
-the base Ubuntu 24.04 ext4 image:
+Application workload tests require a guest rootfs that has
+`redis-server`, `redis-benchmark`, `memcached`, `memtier_benchmark`,
+and the STREAM binary pre-installed. The test harness selects the
+rootfs via the `EXPERIMENT_ROOTFS` environment variable (see §11.2).
+
+To build the rootfs from scratch:
 
 ```bash
-# Mount the rootfs and install packages (on host)
-sudo mkdir -p /mnt/rootfs
-sudo mount -o loop build/artifacts/.../ubuntu-24.04.ext4 /mnt/rootfs
-sudo chroot /mnt/rootfs /bin/bash -c '
+# Identify the base Ubuntu 24.04 ext4 image
+ls build/artifacts/*/x86_64/ubuntu-24.04.ext4
+
+# Copy it so the base image stays pristine
+cp build/artifacts/*/x86_64/ubuntu-24.04.ext4 test_results/app-rootfs.ext4
+cp build/artifacts/*/x86_64/ubuntu-24.04.id_rsa test_results/app-rootfs.id_rsa
+
+# Mount and install tools (requires root on the host)
+sudo mkdir -p /mnt/fc-rootfs
+sudo mount -o loop test_results/app-rootfs.ext4 /mnt/fc-rootfs
+sudo chroot /mnt/fc-rootfs /bin/bash -c '
     apt-get update
     apt-get install -y redis-server redis-tools memcached gcc libc6-dev
 
-    # Install memtier_benchmark
+    # memtier_benchmark (not in Ubuntu repos; build from source)
     apt-get install -y git build-essential autoconf automake \
         libpcre3-dev libevent-dev pkg-config zlib1g-dev libssl-dev
     git clone https://github.com/RedisLabs/memtier_benchmark.git /tmp/memtier
@@ -840,100 +859,165 @@ sudo chroot /mnt/rootfs /bin/bash -c '
     cp /tmp/memtier/memtier_benchmark /usr/local/bin/
     rm -rf /tmp/memtier
 
-    # Compile STREAM (default array size; will be overridden at runtime)
-    cat > /tmp/stream.c << "STREAMEOF"
-    // Download from https://www.cs.virginia.edu/stream/FTP/Code/stream.c
-    // or embed the source here
-    STREAMEOF
-    gcc -O2 -fopenmp -DSTREAM_ARRAY_SIZE=10000000 -DNTIMES=20 \
-        -o /usr/local/bin/stream /tmp/stream.c -lm
-    rm /tmp/stream.c
+    # STREAM benchmark — download stream.c from the official source,
+    # then compile with a representative array size.
+    # The array size below targets ~50% of a 512 MiB guest; the test
+    # harness expects the binary at /usr/local/bin/stream.
+    curl -O https://www.cs.virginia.edu/stream/FTP/Code/stream.c
+    gcc -O2 -fopenmp -DSTREAM_ARRAY_SIZE=11184810 -DNTIMES=20 \
+        -o /usr/local/bin/stream stream.c -lm
+    rm stream.c
 
     apt-get clean
 '
-sudo umount /mnt/rootfs
+sudo umount /mnt/fc-rootfs
 ```
 
-Alternatively, set the `EXPERIMENT_ROOTFS` environment variable to point
-to a pre-built rootfs with these tools, and the test harness will use it
-instead of the default squashfs image.
+> **Note:** The SSH key for the app rootfs must have the same base name
+> with a `.id_rsa` suffix (`test_results/app-rootfs.id_rsa`).  The
+> framework derives the key path automatically from the rootfs path.
 
-To run only the synthetic workloads (no custom rootfs needed):
+### 11.2 Passing `EXPERIMENT_ROOTFS` into the container
+
+`devtool` runs tests inside Docker.  Environment variables are only
+forwarded if they match a known prefix.  The `EXPERIMENT_` prefix was
+added to the forwarding list (see `tools/devtool`, the `env.list`
+generation step) so that `EXPERIMENT_ROOTFS` is passed through
+automatically.
+
+The path must be the **container-internal** path — the repository root
+is mounted at `/firecracker` inside the container:
 
 ```bash
-# Synthetic-only: use default rootfs
-./tools/devtool -y test -- \
-    integration_tests/functional/test_snapshot_live_experiment.py \
-    -k "idle or light or medium or heavy" \
-    -s --log-cli-level=INFO -m ""
+# On the host, point at the container-internal path:
+export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
+
+# devtool then forwards this into the container automatically.
 ```
 
-### 11.2 Execution
+### 11.3 Execution
+
+All `devtool test` commands require `sudo` (tests run Firecracker via
+the jailer, which needs root to set up cgroups and network namespaces).
+
+**Quick smoke test** — validates the full harness end-to-end in ~3
+minutes (512 MiB, idle + medium workloads, plus a `redis_light` live
+snapshot if `EXPERIMENT_ROOTFS` is set):
 
 ```bash
-# Run the full synthetic experiment (400 test runs, ~10-15 hrs)
+export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
+sudo -E ./tools/devtool -y test -- \
+    integration_tests/functional/test_snapshot_live_experiment.py::test_snapshot_experiment_quick \
+    -s --log-cli-level=INFO \
+    -m ""
+```
+
+**Full synthetic experiment** (400 runs, ~10–15 hrs):
+
+```bash
 sudo ./tools/devtool -y test -- \
     integration_tests/functional/test_snapshot_live_experiment.py \
     -k "idle or light or medium or heavy" \
     -s --log-cli-level=INFO \
     -m "" \
     --timeout=300
-
-# Run the full application experiment (240 test runs, ~8-12 hrs)
-# Requires custom rootfs with Redis, Memcached, memtier, STREAM
-sudo ./tools/devtool -y test -- \
-    integration_tests/functional/test_snapshot_live_experiment.py \
-    -k "redis or memcached or stream" \
-    -s --log-cli-level=INFO \
-    -m "" \
-    --timeout=600
-
-# Run all workloads, single iteration (quick sweep, ~1 hr)
-sudo ./tools/devtool -y test -- \
-    integration_tests/functional/test_snapshot_live_experiment.py \
-    -k "0-" \
-    -s --log-cli-level=INFO \
-    -m ""
-
-# Run just Redis workloads at one memory size
-sudo ./tools/devtool -y test -- \
-    integration_tests/functional/test_snapshot_live_experiment.py \
-    -k "redis and 512" \
-    -s --log-cli-level=INFO \
-    -m ""
-
-# Run just STREAM at all memory sizes
-sudo ./tools/devtool -y test -- \
-    integration_tests/functional/test_snapshot_live_experiment.py \
-    -k "stream" \
-    -s --log-cli-level=INFO \
-    -m ""
-
-# Quick smoke test (full vs live, idle + medium, 512 MiB)
-sudo ./tools/devtool -y test -- \
-    integration_tests/functional/test_snapshot_live_experiment.py::test_snapshot_experiment_quick \
-    -s --log-cli-level=INFO \
-    -m ""
 ```
 
-### 11.3 Results Collection
+**Full application experiment** (240 runs, ~8–12 hrs):
+
+```bash
+export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
+sudo -E ./tools/devtool -y test -- \
+    integration_tests/functional/test_snapshot_live_experiment.py \
+    -k "app_experiment" \
+    -s --log-cli-level=INFO \
+    -m "" \
+    --timeout=900
+```
+
+**Targeted runs:**
+
+```bash
+# Redis workloads only, 512 MiB VM
+export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
+sudo -E ./tools/devtool -y test -- \
+    integration_tests/functional/test_snapshot_live_experiment.py \
+    -k "app_experiment and redis and 512" \
+    -s --log-cli-level=INFO -m ""
+
+# STREAM only
+sudo -E ./tools/devtool -y test -- \
+    integration_tests/functional/test_snapshot_live_experiment.py \
+    -k "app_experiment and stream" \
+    -s --log-cli-level=INFO -m ""
+```
+
+**Running in the background (survives SSH disconnects):**
+
+Use `tmux` so the experiment persists if your SSH session drops.
+Output is also tee'd to a log file for later review.
+
+```bash
+export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
+
+tmux new-session -d -s fc-experiment \
+  'sudo -E ./tools/devtool -y test -- \
+     integration_tests/functional/test_snapshot_live_experiment.py \
+     -k "app_experiment" \
+     -s --log-cli-level=INFO -m "" --timeout=900 \
+   2>&1 | tee test_results/app_experiment.log; \
+   echo "=== DONE: exit=$? ===" | tee -a test_results/app_experiment.log'
+
+# Reconnect after disconnect
+tmux attach -t fc-experiment
+
+# Detach without killing
+# Ctrl-b  d
+
+# Watch progress from a separate terminal
+tail -f test_results/app_experiment.log
+```
+
+### 11.4 CSV header note
+
+`experiment_results.csv` is created the first time a test writes a
+row, using the `CSV_FIELDS` list defined in the test file as the
+header.  If the file already exists from a previous run with an older
+version of the code (e.g., before app workload columns were added),
+the header will be missing the new columns and those fields will not
+be readable by `csv.DictReader` with the default fieldname detection.
+
+To fix this for an existing CSV, re-read it with explicit fieldnames:
+
+```python
+import csv
+CSV_FIELDS = [...]  # full list from test_snapshot_live_experiment.py
+with open("test_results/experiment_results.csv") as f:
+    reader = csv.DictReader(f, fieldnames=CSV_FIELDS)
+    next(reader)  # skip the stale header row
+    rows = list(reader)
+```
+
+Or simply delete the old CSV before a fresh run — the file will be
+recreated with the correct header automatically.
+
+### 11.5 Results Collection
 
 Results are written to:
-- `test_results/experiment_results.csv` — machine-readable, one row per test run
-- `test_results/test-report.json` — JSON report with per-test metadata
-- Console output — human-readable summary per configuration
+- `test_results/experiment_results.csv` — one row per test run
+- `test_results/test-report.json` — per-test pass/fail/skip metadata
+- Console (captured in `app_experiment.log` if using the tmux recipe)
 
-**Analysis and visualization scripts:**
+**Analysis and visualization:**
 
 ```bash
 # Print summary tables
 python3 tests/integration_tests/functional/analyze_experiment_results.py \
     test_results/experiment_results.csv
 
-# Generate plots (requires matplotlib)
+# Generate plots (requires matplotlib, produces PNGs in test_results/)
 python3 tests/integration_tests/functional/plot_experiment_results.py \
     test_results/experiment_results.csv
-# Produces PNG files in test_results/
 ```
 
 ---
