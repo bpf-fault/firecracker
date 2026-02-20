@@ -40,6 +40,29 @@ WORKLOAD_PARAMS = {
     "heavy": (4096, 1024, 0.031),     # ~128 MiB/s target
 }
 
+# Application workload experiment — reduced matrix per design doc §6.2
+APP_MEM_SIZES = [512, 2048]
+
+REDIS_WORKLOAD_PARAMS = {
+    "redis_light": {"clients": 2,  "ops": "get"},       # read-heavy
+    "redis_mixed": {"clients": 10, "ops": "set,get"},   # balanced
+    "redis_heavy": {"clients": 50, "ops": "set"},       # write-heavy
+}
+
+MEMCACHED_WORKLOAD_PARAMS = {
+    "memcached_light": {"clients": 2,  "ratio": "1:9"},  # 1 SET : 9 GETs
+    "memcached_heavy": {"clients": 50, "ratio": "1:1"},  # equal SET/GET
+}
+
+# STREAM_ARRAY_SIZES: doubles, targeting ~50% guest RAM across 3 arrays
+STREAM_ARRAY_SIZES = {
+    256:  5_592_405,
+    512:  11_184_810,
+    1024: 22_369_621,
+    2048: 44_739_242,
+    4096: 89_478_485,
+}
+
 RESULTS_FILE = os.environ.get(
     "EXPERIMENT_RESULTS_CSV",
     os.path.join(
@@ -93,6 +116,16 @@ CSV_FIELDS = [
     "workload_during_mibs",
     "workload_degradation_pct",
     "actual_write_rate_mibs",
+    # Application workloads (Redis / Memcached)
+    "app_baseline_ops", "app_during_ops", "app_ops_degradation_pct",
+    "app_baseline_p50_us", "app_baseline_p99_us", "app_baseline_p999_us",
+    "app_during_p50_us",  "app_during_p99_us",  "app_during_p999_us",
+    # STREAM benchmark
+    "stream_baseline_copy_mibs",  "stream_baseline_scale_mibs",
+    "stream_baseline_add_mibs",   "stream_baseline_triad_mibs",
+    "stream_during_copy_mibs",    "stream_during_scale_mibs",
+    "stream_during_add_mibs",     "stream_during_triad_mibs",
+    "stream_triad_degradation_pct",
 ]
 
 
@@ -305,6 +338,447 @@ def _stop_workload(vm):
     """Kill any background dd/sh workload processes in the guest."""
     vm.ssh.check_output("pkill -f 'dd if=/dev/urandom' 2>/dev/null || true")
     vm.ssh.check_output("pkill -f 'of=/tmp/workload' 2>/dev/null || true")
+
+
+# ---------------------------------------------------------------------------
+# Application workload classification helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_redis_workload(wl):
+    """Return True if the workload name is a Redis variant."""
+    return wl in REDIS_WORKLOAD_PARAMS
+
+
+def _is_memcached_workload(wl):
+    """Return True if the workload name is a Memcached variant."""
+    return wl in MEMCACHED_WORKLOAD_PARAMS
+
+
+def _is_stream_workload(wl):
+    """Return True if the workload is the STREAM benchmark."""
+    return wl == "stream"
+
+
+# ---------------------------------------------------------------------------
+# VM boot for application workloads
+# ---------------------------------------------------------------------------
+
+
+def _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib):
+    """Boot a VM for application workload experiments.
+
+    If EXPERIMENT_ROOTFS env var is set, builds a fresh VM using that rootfs.
+    Otherwise uses uvm_plain directly.  Disables memory_monitor, spawns,
+    configures with VCPU_COUNT vCPUs and mem_size_mib RAM, adds a net iface,
+    and waits until SSH is ready.
+    """
+    if os.environ.get("EXPERIMENT_ROOTFS"):
+        vm = microvm_factory.build(
+            kernel=uvm_plain.kernel_file,
+            rootfs=Path(os.environ["EXPERIMENT_ROOTFS"]),
+        )
+    else:
+        vm = uvm_plain
+
+    vm.monitors = [m for m in vm.monitors if m is not vm.memory_monitor]
+    vm.memory_monitor = None
+
+    vm.spawn()
+    vm.basic_config(vcpu_count=VCPU_COUNT, mem_size_mib=mem_size_mib)
+    vm.add_net_iface()
+    vm.start()
+    vm.ssh.check_output("true")
+
+    return vm
+
+
+# ---------------------------------------------------------------------------
+# Tool availability check
+# ---------------------------------------------------------------------------
+
+
+def _check_workload_tools(vm, workload):
+    """Skip the test if the required binaries are absent from the guest rootfs."""
+    if _is_redis_workload(workload):
+        tools = "redis-server redis-cli redis-benchmark"
+    elif _is_memcached_workload(workload):
+        tools = "memcached memtier_benchmark nc"
+    elif _is_stream_workload(workload):
+        tools = "/usr/local/bin/stream"
+    else:
+        return  # synthetic workloads need no extra tools
+
+    _, out, _ = vm.ssh.check_output(
+        f"command -v {tools} >/dev/null 2>&1 && echo AVAILABLE || echo MISSING"
+    )
+    if "MISSING" in out:
+        pytest.skip(f"Required tools for workload '{workload}' not found in guest: {tools}")
+
+
+# ---------------------------------------------------------------------------
+# Redis helpers
+# ---------------------------------------------------------------------------
+
+
+def _setup_redis(vm, mem_size_mib):
+    """Start redis-server and pre-populate it.
+
+    Allocates half of guest RAM as Redis maxmemory (allkeys-lru), then
+    pre-populates roughly 50 % of that budget with 512-byte string values.
+    Returns redis_maxmem in MiB.
+    """
+    redis_maxmem = mem_size_mib // 2
+
+    vm.ssh.check_output(
+        f"redis-server --daemonize yes "
+        f"--maxmemory {redis_maxmem}mb "
+        f"--maxmemory-policy allkeys-lru "
+        f"--save '' --appendonly no"
+    )
+
+    # Wait until Redis is ready.
+    vm.ssh.check_output(
+        "for i in $(seq 1 30); do "
+        "  redis-cli ping | grep -q PONG && break; "
+        "  sleep 0.2; "
+        "done",
+        timeout=15,
+    )
+
+    # Pre-populate: target ~50 % of maxmemory using 512-byte values.
+    prefill_ops = redis_maxmem * 1024  # each op stores ~1 KiB key+value overhead
+    vm.ssh.check_output(
+        f"redis-benchmark -t set -n {prefill_ops} -d 512 -r 1000000 -q",
+        timeout=120,
+    )
+
+    return redis_maxmem
+
+
+def _parse_redis_benchmark_output(output):
+    """Parse redis-benchmark verbose output.
+
+    Returns (ops_per_sec, p50_us, p99_us, p999_us).  Missing values default
+    to 0.0.
+    """
+    ops = 0.0
+    p50 = p99 = p999 = 0.0
+
+    m = re.search(r"([\d.]+) requests per second", output)
+    if m:
+        ops = float(m.group(1))
+
+    # Histogram lines: "  50.00% <= 0.103 milliseconds"
+    # redis-benchmark uses power-of-2 percentile buckets (50, 75, 87.5,
+    # 93.75, 98.44, 99.22, 99.61, 99.90, ...) — there is never an exact
+    # 99.00% or 99.90% line.  Use threshold matching instead: take the
+    # first bucket at or above each target percentile.
+    for line in output.splitlines():
+        m = re.match(r"\s*([\d.]+)%\s*<=\s*([\d.]+)\s*milliseconds", line)
+        if not m:
+            continue
+        pct = float(m.group(1))
+        lat_ms = float(m.group(2))
+        if abs(pct - 50.0) < 0.01:
+            p50 = lat_ms * 1000
+        elif 99.0 <= pct < 99.9 and p99 == 0.0:
+            p99 = lat_ms * 1000
+        elif pct >= 99.9 and p999 == 0.0:
+            p999 = lat_ms * 1000
+
+    return ops, p50, p99, p999
+
+
+def _measure_redis_baseline(vm, workload):
+    """Run a 50 000-op redis-benchmark and return (ops, p50, p99, p999)."""
+    params = REDIS_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ops_arg = params["ops"]
+
+    _, out, _ = vm.ssh.check_output(
+        f"redis-benchmark -t {ops_arg} -n 50000 -c {clients}",
+        timeout=60,
+    )
+    return _parse_redis_benchmark_output(out)
+
+
+def _start_redis_background_workload(vm, workload):
+    """Launch a continuous redis-benchmark loop in the background.
+
+    Lets it settle for 2 s before returning.
+    """
+    params = REDIS_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ops_arg = params["ops"]
+
+    vm.ssh.check_output(
+        f"nohup sh -c '"
+        f"while true; do "
+        f"  redis-benchmark -t {ops_arg} -c {clients} -n 10000 -q 2>/dev/null; "
+        f"done' </dev/null >/dev/null 2>&1 &"
+    )
+    time.sleep(2)
+
+
+def _start_redis_during_burst(vm, workload, baseline_ops):
+    """Launch a fixed-size redis-benchmark burst for the during-snapshot measurement.
+
+    Targets ≈15 s of load.  Writes output to /tmp/redis_during.log and touches
+    /tmp/redis_during.done when complete.
+    """
+    params = REDIS_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ops_arg = params["ops"]
+    n = max(50_000, int(baseline_ops * 15))
+
+    vm.ssh.check_output(
+        f"nohup sh -c '"
+        f"redis-benchmark -t {ops_arg} -c {clients} -n {n} "
+        f"> /tmp/redis_during.log 2>&1; "
+        f"touch /tmp/redis_during.done' "
+        f"</dev/null >/dev/null 2>&1 &"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Memcached helpers
+# ---------------------------------------------------------------------------
+
+
+def _setup_memcached(vm, mem_size_mib):
+    """Start memcached and pre-populate it.
+
+    Uses half guest RAM, 2 threads, port 11211.  Pre-populates all keys.
+    """
+    mem_alloc = mem_size_mib // 2
+
+    # Run memcached in the background via nohup rather than with -d, because
+    # memcached on Ubuntu 24.04 may refuse to daemonize when already running as
+    # root inside the guest.  Use setsid to fully detach from the SSH session.
+    vm.ssh.check_output(
+        f"setsid /usr/bin/memcached -m {mem_alloc} -t 2 -p 11211 "
+        f"</dev/null >/tmp/memcached.log 2>&1 &"
+    )
+
+    # Wait until the TCP port accepts connections (nc -z = port-scan mode).
+    vm.ssh.check_output(
+        "for i in $(seq 1 50); do "
+        "  nc -z 127.0.0.1 11211 2>/dev/null && break; "
+        "  sleep 0.2; "
+        "done; "
+        "nc -z 127.0.0.1 11211 || { echo 'memcached log:'; cat /tmp/memcached.log; exit 1; }",
+        timeout=20,
+    )
+
+    # Pre-populate.
+    vm.ssh.check_output(
+        "memtier_benchmark -p 11211 --protocol=memcache_text "
+        f"-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram -q",
+        timeout=120,
+    )
+
+
+def _parse_memtier_output(output):
+    """Parse memtier_benchmark summary output.
+
+    Finds the 'Totals' line and extracts ops/sec and latency percentiles.
+    Returns (ops, p50_us, p99_us, p999_us).
+    """
+    ops = 0.0
+    p50 = p99 = p999 = 0.0
+
+    for line in output.splitlines():
+        if "Totals" not in line:
+            continue
+        parts = line.split()
+        # Columns: Type  Ops/sec  Hits/sec  Miss/sec  Avg Lat  p50   p99   p99.9  ...
+        # Indices:   0      1        2         3         4      5     6      7
+        try:
+            ops = float(parts[1])
+            # latency columns are in milliseconds; convert to microseconds
+            p50  = float(parts[5]) * 1000
+            p99  = float(parts[6]) * 1000
+            p999 = float(parts[7]) * 1000
+        except (IndexError, ValueError):
+            pass
+        break
+
+    return ops, p50, p99, p999
+
+
+def _measure_memcached_baseline(vm, workload):
+    """Run a 10-second memtier benchmark and return (ops, p50, p99, p999)."""
+    params = MEMCACHED_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ratio = params["ratio"]
+
+    _, out, _ = vm.ssh.check_output(
+        f"memtier_benchmark -p 11211 --protocol=memcache_text "
+        f"-c {clients} -t 2 --ratio={ratio} --test-time=10 --hide-histogram",
+        timeout=30,
+    )
+    return _parse_memtier_output(out)
+
+
+def _start_memcached_background_workload(vm, workload):
+    """Launch a long-running memtier workload (600 s) in the background."""
+    params = MEMCACHED_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ratio = params["ratio"]
+
+    vm.ssh.check_output(
+        f"nohup memtier_benchmark -p 11211 --protocol=memcache_text "
+        f"-c {clients} -t 2 --ratio={ratio} --test-time=600 "
+        f"--hide-histogram -q "
+        f"</dev/null >/dev/null 2>&1 &"
+    )
+    time.sleep(2)
+
+
+def _start_memcached_during_burst(vm, workload):
+    """Launch a 30-second memtier burst for the during-snapshot measurement.
+
+    Writes output to /tmp/memtier_during.log and sentinel to
+    /tmp/memtier_during.done.
+    """
+    params = MEMCACHED_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ratio = params["ratio"]
+
+    vm.ssh.check_output(
+        f"nohup sh -c '"
+        f"memtier_benchmark -p 11211 --protocol=memcache_text "
+        f"-c {clients} -t 2 --ratio={ratio} --test-time=30 --hide-histogram "
+        f"> /tmp/memtier_during.log 2>&1; "
+        f"touch /tmp/memtier_during.done' "
+        f"</dev/null >/dev/null 2>&1 &"
+    )
+
+
+# ---------------------------------------------------------------------------
+# STREAM helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_stream_output(output):
+    """Parse STREAM benchmark output into a dict of MiB/s values.
+
+    Converts MB/s → MiB/s (×1e6 / 1024²).
+    Returns {"copy": X, "scale": X, "add": X, "triad": X}.
+    """
+    results = {}
+    mb_to_mib = 1e6 / (1024 * 1024)
+    for kernel in ("Copy", "Scale", "Add", "Triad"):
+        m = re.search(rf"{kernel}:\s+([\d.]+)", output, re.IGNORECASE)
+        if m:
+            results[kernel.lower()] = float(m.group(1)) * mb_to_mib
+    return results
+
+
+def _run_stream_benchmark(vm):
+    """Execute /usr/local/bin/stream and return (copy, scale, add, triad) in MiB/s."""
+    _, out, _ = vm.ssh.check_output("/usr/local/bin/stream", timeout=120)
+    r = _parse_stream_output(out)
+    return r.get("copy", 0.0), r.get("scale", 0.0), r.get("add", 0.0), r.get("triad", 0.0)
+
+
+def _start_stream_during_burst(vm):
+    """Launch a STREAM benchmark burst in the background.
+
+    Writes output to /tmp/stream_during.log and touches /tmp/stream_during.done.
+    """
+    vm.ssh.check_output(
+        "nohup sh -c '"
+        "/usr/local/bin/stream > /tmp/stream_during.log 2>&1; "
+        "touch /tmp/stream_during.done' "
+        "</dev/null >/dev/null 2>&1 &"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Common utilities for application workloads
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_sentinel(vm, path, timeout=180):
+    """Block until the sentinel file at `path` appears inside the guest."""
+    vm.ssh.check_output(
+        f"until test -f {path}; do sleep 0.3; done",
+        timeout=timeout,
+    )
+
+
+def _stop_all_app_workloads(vm):
+    """Kill all running application benchmark processes in the guest."""
+    vm.ssh.check_output(
+        "pkill -f redis-benchmark 2>/dev/null || true; "
+        "pkill -f memtier_benchmark 2>/dev/null || true; "
+        "pkill -f stream 2>/dev/null || true"
+    )
+
+
+def _log_app_summary(row):
+    """Log a human-readable summary of application workload metrics."""
+    mode = row["snapshot_mode"]
+    mem  = row["mem_size_mib"]
+    wl   = row["workload"]
+    it   = row["iteration"]
+
+    logger.info("=" * 70)
+    logger.info("APP RUN: %s MiB, %s workload, %s snapshot, iteration %s", mem, wl, mode, it)
+    logger.info("-" * 70)
+
+    if _is_redis_workload(wl) or _is_memcached_workload(wl):
+        logger.info(
+            "  Baseline ops/sec:       %8.0f", row.get("app_baseline_ops", 0)
+        )
+        logger.info(
+            "  During-snap ops/sec:    %8.0f", row.get("app_during_ops", 0)
+        )
+        logger.info(
+            "  Ops degradation:        %8.1f %%", row.get("app_ops_degradation_pct", 0)
+        )
+        logger.info(
+            "  Baseline latency p50/p99/p999: %.0f / %.0f / %.0f µs",
+            row.get("app_baseline_p50_us", 0),
+            row.get("app_baseline_p99_us", 0),
+            row.get("app_baseline_p999_us", 0),
+        )
+        logger.info(
+            "  During   latency p50/p99/p999: %.0f / %.0f / %.0f µs",
+            row.get("app_during_p50_us", 0),
+            row.get("app_during_p99_us", 0),
+            row.get("app_during_p999_us", 0),
+        )
+    elif _is_stream_workload(wl):
+        logger.info(
+            "  Baseline Copy/Scale/Add/Triad: %.0f / %.0f / %.0f / %.0f MiB/s",
+            row.get("stream_baseline_copy_mibs", 0),
+            row.get("stream_baseline_scale_mibs", 0),
+            row.get("stream_baseline_add_mibs", 0),
+            row.get("stream_baseline_triad_mibs", 0),
+        )
+        logger.info(
+            "  During   Copy/Scale/Add/Triad: %.0f / %.0f / %.0f / %.0f MiB/s",
+            row.get("stream_during_copy_mibs", 0),
+            row.get("stream_during_scale_mibs", 0),
+            row.get("stream_during_add_mibs", 0),
+            row.get("stream_during_triad_mibs", 0),
+        )
+        logger.info(
+            "  Triad degradation:      %8.1f %%", row.get("stream_triad_degradation_pct", 0)
+        )
+
+    logger.info(
+        "  RSS pre/peak:           %s / %s KiB",
+        row.get("rss_pre_kib", "?"),
+        row.get("rss_peak_kib", "?"),
+    )
+    logger.info(
+        "  Mem file size:          %s bytes", row.get("mem_file_bytes", "?")
+    )
+    logger.info("=" * 70)
 
 
 def _write_csv_row(row):
@@ -568,6 +1042,214 @@ def _run_live_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
 
 
 # ---------------------------------------------------------------------------
+# Experiment: Full snapshot path — application workloads
+# ---------------------------------------------------------------------------
+
+
+def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration):
+    """Execute one full-snapshot experiment run for an application workload.
+
+    The VM is paused for the entire snapshot, so during-snapshot metrics are
+    always zero / 100 % degradation.
+    """
+    row = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "mem_size_mib": mem_size_mib,
+        "workload": workload,
+        "snapshot_mode": "full",
+        "iteration": iteration,
+    }
+
+    ops = p50 = p99 = p999 = 0.0
+
+    if _is_redis_workload(workload):
+        _setup_redis(vm, mem_size_mib)
+        ops, p50, p99, p999 = _measure_redis_baseline(vm, workload)
+        _start_redis_background_workload(vm, workload)
+    elif _is_memcached_workload(workload):
+        _setup_memcached(vm, mem_size_mib)
+        ops, p50, p99, p999 = _measure_memcached_baseline(vm, workload)
+        _start_memcached_background_workload(vm, workload)
+    elif _is_stream_workload(workload):
+        b_copy, b_scale, b_add, b_triad = _run_stream_benchmark(vm)
+        row["stream_baseline_copy_mibs"]  = round(b_copy, 1)
+        row["stream_baseline_scale_mibs"] = round(b_scale, 1)
+        row["stream_baseline_add_mibs"]   = round(b_add, 1)
+        row["stream_baseline_triad_mibs"] = round(b_triad, 1)
+
+    if _is_redis_workload(workload) or _is_memcached_workload(workload):
+        row["app_baseline_ops"]     = round(ops, 1)
+        row["app_baseline_p50_us"]  = round(p50, 1)
+        row["app_baseline_p99_us"]  = round(p99, 1)
+        row["app_baseline_p999_us"] = round(p999, 1)
+
+    pid = vm.firecracker_pid
+    row["rss_pre_kib"] = _get_rss_kib(pid)
+
+    # Take full snapshot — pauses the VM.
+    snapshot, timings = _do_full_snapshot_timed(vm)
+    row.update(timings)
+    row["downtime_us"] = int(timings["full_total_ms"] * 1000)
+    row["total_us"]    = int(timings["full_total_ms"] * 1000)
+
+    create_s = timings["full_create_ms"] / 1000
+    row["full_throughput_mibs"] = round(mem_size_mib / create_s, 1) if create_s > 0 else 0
+
+    # VM is paused — no requests served during snapshot.
+    if _is_redis_workload(workload) or _is_memcached_workload(workload):
+        row["app_during_ops"]            = 0
+        row["app_during_p50_us"]         = 0
+        row["app_during_p99_us"]         = 0
+        row["app_during_p999_us"]        = 0
+        row["app_ops_degradation_pct"]   = 100.0
+    elif _is_stream_workload(workload):
+        row["stream_during_copy_mibs"]       = 0
+        row["stream_during_scale_mibs"]      = 0
+        row["stream_during_add_mibs"]        = 0
+        row["stream_during_triad_mibs"]      = 0
+        row["stream_triad_degradation_pct"]  = 100.0
+
+    row["rss_peak_kib"] = _get_peak_rss_kib(pid)
+
+    mem_path = Path(vm.chroot()) / "mem"
+    row["mem_file_bytes"] = mem_path.stat().st_size if mem_path.exists() else 0
+
+    _, restore_timings = _do_restore_timed(microvm_factory, snapshot)
+    row.update(restore_timings)
+
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Experiment: Live snapshot path — application workloads
+# ---------------------------------------------------------------------------
+
+
+def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration):
+    """Execute one live-snapshot experiment run for an application workload.
+
+    The VM keeps running during the snapshot, so we can measure real
+    during-snapshot application performance.
+    """
+    row = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "mem_size_mib": mem_size_mib,
+        "workload": workload,
+        "snapshot_mode": "live",
+        "iteration": iteration,
+    }
+
+    ops = p50 = p99 = p999 = 0.0
+
+    if _is_redis_workload(workload):
+        _setup_redis(vm, mem_size_mib)
+        ops, p50, p99, p999 = _measure_redis_baseline(vm, workload)
+        _start_redis_background_workload(vm, workload)
+        _start_redis_during_burst(vm, workload, ops)
+    elif _is_memcached_workload(workload):
+        _setup_memcached(vm, mem_size_mib)
+        ops, p50, p99, p999 = _measure_memcached_baseline(vm, workload)
+        _start_memcached_background_workload(vm, workload)
+        _start_memcached_during_burst(vm, workload)
+    elif _is_stream_workload(workload):
+        b_copy, b_scale, b_add, b_triad = _run_stream_benchmark(vm)
+        row["stream_baseline_copy_mibs"]  = round(b_copy, 1)
+        row["stream_baseline_scale_mibs"] = round(b_scale, 1)
+        row["stream_baseline_add_mibs"]   = round(b_add, 1)
+        row["stream_baseline_triad_mibs"] = round(b_triad, 1)
+        _start_stream_during_burst(vm)
+
+    if _is_redis_workload(workload) or _is_memcached_workload(workload):
+        row["app_baseline_ops"]     = round(ops, 1)
+        row["app_baseline_p50_us"]  = round(p50, 1)
+        row["app_baseline_p99_us"]  = round(p99, 1)
+        row["app_baseline_p999_us"] = round(p999, 1)
+
+    pid = vm.firecracker_pid
+    row["rss_pre_kib"] = _get_rss_kib(pid)
+
+    # Take live snapshot — VM keeps running.
+    assert vm.state == "Running"
+    snapshot = vm.snapshot_live()
+    assert vm.state == "Running"
+
+    row["rss_peak_kib"] = _get_peak_rss_kib(pid)
+
+    mem_path = Path(vm.chroot()) / "mem"
+    row["mem_file_bytes"] = mem_path.stat().st_size if mem_path.exists() else 0
+
+    # Parse Firecracker log for phase breakdown.
+    live_metrics = _parse_live_snapshot_log(vm.log_data)
+    row.update(live_metrics)
+
+    total_pages = live_metrics.get("total_pages", 0)
+    fault_pages = live_metrics.get("fault_pages", 0)
+    stream_us   = live_metrics.get("stream_us", 0)
+
+    row["fault_fraction_pct"] = (
+        round(fault_pages / total_pages * 100, 3) if total_pages > 0 else 0
+    )
+    if stream_us > 0:
+        mem_bytes = total_pages * 4096
+        row["throughput_mibs"] = round(
+            (mem_bytes / (1024 * 1024)) / (stream_us / 1e6), 1
+        )
+    else:
+        row["throughput_mibs"] = 0
+
+    # Wait for during-snapshot benchmark to complete and collect results.
+    if _is_redis_workload(workload):
+        _wait_for_sentinel(vm, "/tmp/redis_during.done")
+        _, log_out, _ = vm.ssh.check_output("cat /tmp/redis_during.log")
+        d_ops, d_p50, d_p99, d_p999 = _parse_redis_benchmark_output(log_out)
+        row["app_during_ops"]    = round(d_ops, 1)
+        row["app_during_p50_us"] = round(d_p50, 1)
+        row["app_during_p99_us"] = round(d_p99, 1)
+        row["app_during_p999_us"] = round(d_p999, 1)
+        row["app_ops_degradation_pct"] = (
+            round((1 - d_ops / ops) * 100, 1) if ops > 0 else 0
+        )
+    elif _is_memcached_workload(workload):
+        _wait_for_sentinel(vm, "/tmp/memtier_during.done")
+        _, log_out, _ = vm.ssh.check_output("cat /tmp/memtier_during.log")
+        d_ops, d_p50, d_p99, d_p999 = _parse_memtier_output(log_out)
+        row["app_during_ops"]    = round(d_ops, 1)
+        row["app_during_p50_us"] = round(d_p50, 1)
+        row["app_during_p99_us"] = round(d_p99, 1)
+        row["app_during_p999_us"] = round(d_p999, 1)
+        row["app_ops_degradation_pct"] = (
+            round((1 - d_ops / ops) * 100, 1) if ops > 0 else 0
+        )
+    elif _is_stream_workload(workload):
+        _wait_for_sentinel(vm, "/tmp/stream_during.done")
+        _, log_out, _ = vm.ssh.check_output("cat /tmp/stream_during.log")
+        d = _parse_stream_output(log_out)
+        d_copy  = d.get("copy", 0.0)
+        d_scale = d.get("scale", 0.0)
+        d_add   = d.get("add", 0.0)
+        d_triad = d.get("triad", 0.0)
+        row["stream_during_copy_mibs"]  = round(d_copy, 1)
+        row["stream_during_scale_mibs"] = round(d_scale, 1)
+        row["stream_during_add_mibs"]   = round(d_add, 1)
+        row["stream_during_triad_mibs"] = round(d_triad, 1)
+        b_triad = row.get("stream_baseline_triad_mibs", 0)
+        row["stream_triad_degradation_pct"] = (
+            round((1 - d_triad / b_triad) * 100, 1) if b_triad > 0 else 0
+        )
+
+    # VM should still be responsive.
+    vm.ssh.check_output("true")
+
+    # Restore from the live snapshot.
+    rvm, restore_timings = _do_restore_timed(microvm_factory, snapshot)
+    row.update(restore_timings)
+    rvm.ssh.check_output("true")
+    rvm.kill()
+
+    return row
+
+
+# ---------------------------------------------------------------------------
 # Boot and condition a VM for the experiment
 # ---------------------------------------------------------------------------
 
@@ -740,3 +1422,77 @@ def test_snapshot_experiment_quick(
             live_row.get("workload_degradation_pct", 0),
         )
     logger.info("=" * 70)
+
+    # --- Smoke test: redis_light at 512 MiB (single iteration) ---
+    # Only runs when EXPERIMENT_ROOTFS is set to a rootfs that has Redis.
+    # Builds a completely fresh VM — we cannot reuse uvm_plain (already paused)
+    # or vm_live (live snapshot taken from it).
+    experiment_rootfs = os.environ.get("EXPERIMENT_ROOTFS")
+    if mem_size_mib == 512 and experiment_rootfs:
+        vm_redis = microvm_factory.build(
+            kernel=vm_full.kernel_file,
+            rootfs=Path(experiment_rootfs),
+        )
+        vm_redis.monitors = [m for m in vm_redis.monitors if m is not vm_redis.memory_monitor]
+        vm_redis.memory_monitor = None
+        vm_redis.spawn()
+        vm_redis.basic_config(vcpu_count=VCPU_COUNT, mem_size_mib=mem_size_mib)
+        vm_redis.add_net_iface()
+        vm_redis.start()
+        vm_redis.ssh.check_output("true")
+        _check_workload_tools(vm_redis, "redis_light")
+        redis_row = _run_live_snapshot_app(
+            vm_redis, microvm_factory, mem_size_mib, "redis_light", iteration=0
+        )
+        _write_csv_row(redis_row)
+        _log_app_summary(redis_row)
+
+
+# ---------------------------------------------------------------------------
+# Parametrized experiment tests — application workloads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.nonci
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
+@pytest.mark.parametrize("workload", [
+    "redis_light", "redis_mixed", "redis_heavy",
+    "memcached_light", "memcached_heavy", "stream",
+])
+@pytest.mark.parametrize("iteration", range(10))
+def test_full_snapshot_app_experiment(
+    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
+):
+    """Collect full-snapshot metrics under Redis, Memcached, or STREAM workload."""
+    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
+    _check_workload_tools(vm, workload)
+    row = _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
+    record_property("downtime_us", row.get("downtime_us", 0))
+    record_property("full_throughput_mibs", row.get("full_throughput_mibs", 0))
+    record_property("restore_api_ms", row.get("restore_api_ms", 0))
+    _write_csv_row(row)
+    _log_app_summary(row)
+
+
+@pytest.mark.nonci
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
+@pytest.mark.parametrize("workload", [
+    "redis_light", "redis_mixed", "redis_heavy",
+    "memcached_light", "memcached_heavy", "stream",
+])
+@pytest.mark.parametrize("iteration", range(10))
+def test_live_snapshot_app_experiment(
+    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
+):
+    """Collect live-snapshot metrics under Redis, Memcached, or STREAM workload."""
+    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
+    _check_workload_tools(vm, workload)
+    row = _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
+    record_property("downtime_us", row.get("downtime_us", 0))
+    record_property("throughput_mibs", row.get("throughput_mibs", 0))
+    record_property("fault_fraction_pct", row.get("fault_fraction_pct", 0))
+    record_property("restore_api_ms", row.get("restore_api_ms", 0))
+    _write_csv_row(row)
+    _log_app_summary(row)
