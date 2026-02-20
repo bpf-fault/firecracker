@@ -571,10 +571,13 @@ def _setup_memcached(vm, mem_size_mib):
         timeout=20,
     )
 
-    # Pre-populate.
+    # Pre-populate: load 500 000 keys with 512-byte values (SET only).
+    # --key-maximum is required when using -n allkeys; without it
+    # memtier_benchmark prints its help text and exits non-zero.
     vm.ssh.check_output(
         "memtier_benchmark -p 11211 --protocol=memcache_text "
-        f"-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram -q",
+        "--key-maximum=500000 --data-size=512 "
+        "-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram -q",
         timeout=120,
     )
 
