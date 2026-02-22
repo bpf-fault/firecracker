@@ -435,55 +435,63 @@ def plot_app_ops_degradation(grouped, outdir):
 
 
 def plot_app_tail_latency(grouped, outdir):
-    """Grouped bar chart of p99 latency: baseline vs during live snapshot."""
+    """Three-bar grouped chart: baseline / during / post p99 and avg latency."""
     if not any(k[1] in APP_WORKLOADS for k in grouped):
         print("  Skipping plot 10: no app workload data in CSV")
         return
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
 
     x = range(len(APP_WORKLOADS))
-    width = 0.18
-    mem_colors_base  = {512: "#90CAF9", 2048: "#1565C0"}
-    mem_colors_during = {512: "#EF9A9A", 2048: "#B71C1C"}
+    width = 0.12
+    # Three windows × two memory sizes = 6 bar clusters per workload.
+    # Offsets: base-512, dur-512, post-512, base-2048, dur-2048, post-2048
+    offsets_512  = [-2.5, -1.5, -0.5]
+    offsets_2048 = [ 0.5,  1.5,  2.5]
+    mem_palettes = {
+        512:  ["#90CAF9", "#EF9A9A", "#A5D6A7"],   # blue / red / green
+        2048: ["#1565C0", "#B71C1C", "#2E7D32"],
+    }
+    window_labels = ["Baseline", "During snap", "Post-snap"]
 
-    for i, mem in enumerate(APP_MEM_SIZES):
-        base_p99   = []
-        during_p99 = []
-        for wl in APP_WORKLOADS:
-            live_rows = grouped.get((mem, wl, "live"), [])
-            base_p99.append(avg([r.get("app_baseline_p99_us", 0) for r in live_rows]))
-            during_p99.append(avg([r.get("app_during_p99_us", 0) for r in live_rows]))
+    for ax, metric, ylabel, title_suffix in [
+        (axes[0], "app_{}_p99_us",   "p99 Latency (µs)",     "p99"),
+        (axes[1], "app_{}_avg_us",   "Avg Latency (µs)",     "Avg"),
+    ]:
+        # Override field names for post-snap (different prefix).
+        def _get(rows, window, m):
+            if window == "baseline":
+                return avg([r.get(f"app_baseline_{m}", 0) for r in rows])
+            if window == "during":
+                return avg([r.get(f"app_during_{m}", 0) for r in rows])
+            # post
+            field = "post_snap_p99_us" if "p99" in m else "post_snap_avg_us"
+            return avg([r.get(field, 0) for r in rows])
 
-        offset_base   = (-1.5 + i * 2) * width
-        offset_during = (-0.5 + i * 2) * width
-        bars_base = ax.bar(
-            [xi + offset_base for xi in x], base_p99, width,
-            label=f"Baseline {mem} MiB", color=mem_colors_base[mem], edgecolor="white",
-        )
-        bars_during = ax.bar(
-            [xi + offset_during for xi in x], during_p99, width,
-            label=f"During snapshot {mem} MiB", color=mem_colors_during[mem], edgecolor="white",
-        )
-
-        # Annotate spike factor.
-        for xi, b, d in zip(x, base_p99, during_p99):
-            if b > 0 and d > 0:
-                factor = d / b
-                ax.text(
-                    xi + offset_during, d + max(during_p99) * 0.01,
-                    f"×{factor:.1f}", ha="center", va="bottom", fontsize=7,
+        for mem, offsets in [(512, offsets_512), (2048, offsets_2048)]:
+            palette = mem_palettes[mem]
+            for j, (window, label) in enumerate(
+                [("baseline", "Baseline"), ("during", "During"), ("post", "Post-snap")]
+            ):
+                vals = [_get(grouped.get((mem, wl, "live"), []), window,
+                             "p99_us" if "p99" in metric else "avg_us")
+                        for wl in APP_WORKLOADS]
+                ax.bar(
+                    [xi + offsets[j] * width for xi in x], vals, width,
+                    label=f"{label} {mem} MiB", color=palette[j], edgecolor="white",
                 )
 
-    ax.set_xlabel("Application Workload", fontsize=12)
-    ax.set_ylabel("p99 Latency (µs)", fontsize=12)
-    ax.set_title("Application p99 Latency: Baseline vs During Live Snapshot", fontsize=14, fontweight="bold")
-    ax.set_xticks(x)
-    ax.set_xticklabels([w.replace("_", "\n") for w in APP_WORKLOADS], fontsize=9)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, axis="y")
-    ax.set_ylim(bottom=0)
+        ax.set_xlabel("Application Workload", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(f"{title_suffix} Latency — Baseline / During / Post (Live snapshot)",
+                     fontsize=12, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels([w.replace("_", "\n") for w in APP_WORKLOADS], fontsize=8)
+        ax.legend(fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.set_ylim(bottom=0)
 
+    fig.tight_layout()
     _savefig(fig, outdir, "10_app_tail_latency.png")
 
 
@@ -493,42 +501,63 @@ def plot_app_tail_latency(grouped, outdir):
 
 
 def plot_stream_bandwidth(grouped, outdir):
-    """Grouped bar chart of STREAM kernel bandwidth for 512 and 2048 MiB VMs."""
+    """Three-bar grouped chart of STREAM kernel bandwidth: baseline/during/post."""
     if not any(k[1] == "stream" for k in grouped):
         print("  Skipping plot 11: no STREAM workload data in CSV")
         return
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
 
     n_kernels = len(STREAM_KERNELS)
     x = range(n_kernels)
-    width = 0.18
-    mem_colors_base   = {512: "#A5D6A7", 2048: "#1B5E20"}
-    mem_colors_during = {512: "#FFCC80", 2048: "#E65100"}
+    width = 0.12
+    # Three windows × two memory sizes = 6 bar positions per kernel.
+    palettes = {
+        512:  ["#A5D6A7", "#FFCC80", "#90CAF9"],   # green / orange / blue
+        2048: ["#1B5E20", "#E65100", "#0D47A1"],
+    }
+    offsets_512  = [-2.5, -1.5, -0.5]
+    offsets_2048 = [ 0.5,  1.5,  2.5]
 
-    for i, mem in enumerate(APP_MEM_SIZES):
+    for mem, offsets in [(512, offsets_512), (2048, offsets_2048)]:
         live_rows = grouped.get((mem, "stream", "live"), [])
-        base_vals   = [avg([r.get(f"stream_baseline_{k}_mibs", 0) for r in live_rows]) for k in STREAM_KERNELS]
-        during_vals = [avg([r.get(f"stream_during_{k}_mibs",   0) for r in live_rows]) for k in STREAM_KERNELS]
+        windows = [
+            ("baseline", f"Baseline {mem} MiB"),
+            ("during",   f"During snap {mem} MiB"),
+            ("post",     f"Post-snap {mem} MiB"),
+        ]
+        for j, (window, label) in enumerate(windows):
+            if window == "post":
+                vals = [avg([r.get(f"stream_post_{k}_mibs", 0) for r in live_rows])
+                        for k in STREAM_KERNELS]
+            else:
+                vals = [avg([r.get(f"stream_{window}_{k}_mibs", 0) for r in live_rows])
+                        for k in STREAM_KERNELS]
+            ax.bar(
+                [xi + offsets[j] * width for xi in x], vals, width,
+                label=label, color=palettes[mem][j], edgecolor="white",
+            )
 
-        offset_base   = (-1.5 + i * 2) * width
-        offset_during = (-0.5 + i * 2) * width
-
-        ax.bar(
-            [xi + offset_base for xi in x], base_vals, width,
-            label=f"Baseline {mem} MiB", color=mem_colors_base[mem], edgecolor="white",
-        )
-        ax.bar(
-            [xi + offset_during for xi in x], during_vals, width,
-            label=f"During snapshot {mem} MiB", color=mem_colors_during[mem], edgecolor="white",
-        )
+        # Annotate overall Triad mean ± stddev above the Triad group.
+        triad_idx = STREAM_KERNELS.index("triad")
+        ov_mean = avg([r.get("overall_triad_mean_mibs",   0) for r in live_rows])
+        ov_std  = avg([r.get("overall_triad_stddev_mibs", 0) for r in live_rows])
+        if ov_mean > 0:
+            ax.annotate(
+                f"Overall\n{ov_mean:.0f}±{ov_std:.0f}",
+                xy=(triad_idx + offsets_2048[1] * width if mem == 2048
+                    else triad_idx + offsets_512[1] * width, ov_mean),
+                xytext=(0, 18), textcoords="offset points",
+                ha="center", fontsize=7, color=palettes[mem][1],
+            )
 
     ax.set_xlabel("STREAM Kernel", fontsize=12)
     ax.set_ylabel("Bandwidth (MiB/s)", fontsize=12)
-    ax.set_title("STREAM Benchmark Bandwidth: Baseline vs During Live Snapshot", fontsize=14, fontweight="bold")
+    ax.set_title("STREAM Benchmark Bandwidth: Baseline / During / Post Snapshot",
+                 fontsize=14, fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels([k.capitalize() for k in STREAM_KERNELS])
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=9, ncol=2)
     ax.grid(True, alpha=0.3, axis="y")
     ax.set_ylim(bottom=0)
 
@@ -597,6 +626,128 @@ def plot_fault_fraction_comparison(grouped, outdir):
 
 
 # ---------------------------------------------------------------------------
+# Plot 13: Overall avg latency with error bars — full vs live per workload
+# ---------------------------------------------------------------------------
+
+
+def plot_overall_avg_latency(grouped, outdir):
+    """Bar+error chart of overall_avg_latency_us_mean ± stddev for app workloads."""
+    if not any(k[1] in APP_WORKLOADS for k in grouped):
+        print("  Skipping plot 13: no app workload data in CSV")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
+
+    x = range(len(APP_WORKLOADS))
+    width = 0.18
+    # Full and live × two memory sizes = 4 bar positions per workload.
+    config = [
+        ("full", 512,  -1.5, "#BDBDBD"),
+        ("live", 512,  -0.5, "#90CAF9"),
+        ("full", 2048,  0.5, "#757575"),
+        ("live", 2048,  1.5, "#1565C0"),
+    ]
+
+    for ax, metric, ylabel, title in [
+        (axes[0], "overall_avg_latency_us", "Overall Avg Latency (µs)", "Average Latency"),
+        (axes[1], "overall_p99_us",         "Overall p99 Latency (µs)", "p99 Latency"),
+    ]:
+        mean_field = f"{metric}_mean"
+        std_field  = f"{metric}_stddev"
+
+        for mode, mem, offset, color in config:
+            means  = []
+            errors = []
+            for wl in APP_WORKLOADS:
+                rr = grouped.get((mem, wl, mode), [])
+                means.append( avg([r.get(mean_field, 0) for r in rr]))
+                errors.append(avg([r.get(std_field,  0) for r in rr]))
+            ax.bar(
+                [xi + offset * width for xi in x], means, width,
+                yerr=errors, capsize=3,
+                label=f"{mode.capitalize()} {mem} MiB",
+                color=color, edgecolor="white", error_kw={"elinewidth": 1.2},
+            )
+
+        ax.set_xlabel("Application Workload", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(f"Overall Run {title} (mean ± stddev, full vs live)",
+                     fontsize=12, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels([w.replace("_", "\n") for w in APP_WORKLOADS], fontsize=8)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.set_ylim(bottom=0)
+
+    fig.tight_layout()
+    _savefig(fig, outdir, "13_overall_avg_latency.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 14: Three-window throughput recovery — synthetic workloads
+# ---------------------------------------------------------------------------
+
+
+def plot_three_window_throughput(grouped, outdir):
+    """Baseline / during / post throughput for synthetic dd workloads by memory size."""
+    syn_workloads = [w for w in WORKLOADS if w != "idle"]
+    has_data = any(
+        grouped.get((m, wl, mode), [])
+        for m in MEM_SIZES for wl in syn_workloads for mode in ["full", "live"]
+    )
+    if not has_data:
+        print("  Skipping plot 14: no synthetic workload throughput data in CSV")
+        return
+
+    fig, axes = plt.subplots(1, len(syn_workloads), figsize=(5 * len(syn_workloads), 6),
+                             sharey=False)
+    if len(syn_workloads) == 1:
+        axes = [axes]
+
+    x = range(len(MEM_SIZES))
+    width = 0.22
+    # baseline / during / post for live; baseline / post for full (during=0).
+    palette_live = ["#42A5F5", "#EF5350", "#66BB6A"]   # blue / red / green
+    palette_full = ["#BDBDBD", "#E0E0E0", "#9E9E9E"]
+
+    for ax, wl in zip(axes, syn_workloads):
+        for mode, palette, offsets in [
+            ("live", palette_live, [-1.0, 0.0,  1.0]),
+            ("full", palette_full, [-1.5, None, 1.5]),
+        ]:
+            windows = [
+                ("workload_baseline_mibs", "Baseline"),
+                ("workload_during_mibs",   "During"),
+                ("post_snap_throughput_mibs", "Post-snap"),
+            ]
+            for j, (field, label) in enumerate(windows):
+                if mode == "full" and label == "During":
+                    continue   # full snapshot: VM was paused, skip
+                offset = offsets[j]
+                vals = [avg([r.get(field, 0) for r in grouped.get((m, wl, mode), [])])
+                        for m in MEM_SIZES]
+                ax.bar(
+                    [xi + offset * width for xi in x], vals, width,
+                    label=f"{label} ({mode})",
+                    color=palette[j], edgecolor="white",
+                )
+
+        ax.set_title(f"{wl.capitalize()} workload", fontsize=12, fontweight="bold")
+        ax.set_xlabel("VM Memory (MiB)", fontsize=11)
+        ax.set_ylabel("Write Throughput (MiB/s)", fontsize=11)
+        ax.set_xticks(x)
+        ax.set_xticklabels(MEM_SIZES)
+        ax.legend(fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.set_ylim(bottom=0)
+
+    fig.suptitle("Synthetic Workload Throughput: Baseline / During / Post Snapshot",
+                 fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    _savefig(fig, outdir, "14_three_window_throughput.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -627,9 +778,11 @@ def main():
     plot_app_tail_latency(grouped, outdir)
     plot_stream_bandwidth(grouped, outdir)
     plot_fault_fraction_comparison(grouped, outdir)
+    plot_overall_avg_latency(grouped, outdir)
+    plot_three_window_throughput(grouped, outdir)
 
     print()
-    print(f"Done! {12} plots saved to {outdir}/")
+    print(f"Done! {14} plots saved to {outdir}/")
 
 
 if __name__ == "__main__":

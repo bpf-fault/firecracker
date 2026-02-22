@@ -1106,9 +1106,9 @@ def _run_full_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
     # Clean up restored VM.
     rvm.kill()
 
-    # Attach snapshot object for callers that need to restore from it
-    # (not written to CSV — extrasaction="ignore" skips unknown keys).
-    row["_snapshot"] = snapshot
+    # Delete snapshot files immediately — mem file is VM-memory-size bytes and
+    # accumulates quickly across iterations if left until chroot teardown.
+    snapshot.delete()
 
     return row
 
@@ -1209,6 +1209,10 @@ def _run_live_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
     rvm.ssh.check_output("true")
     rvm.kill()
 
+    # Delete snapshot files immediately — mem file is VM-memory-size bytes and
+    # accumulates quickly across iterations if left until chroot teardown.
+    snapshot.delete()
+
     return row
 
 
@@ -1289,6 +1293,10 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
 
     rvm, restore_timings = _do_restore_timed(microvm_factory, snapshot)
     row.update(restore_timings)
+
+    # Delete snapshot files immediately after restore — mem file is
+    # VM-memory-size bytes and accumulates quickly across iterations.
+    snapshot.delete()
 
     # Post-snapshot: measure on the restored VM (resumed from pre-pause state).
     if _is_redis_workload(workload):
@@ -1552,6 +1560,10 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     row.update(restore_timings)
     rvm.ssh.check_output("true")
     rvm.kill()
+
+    # Delete snapshot files immediately — mem file is VM-memory-size bytes
+    # and accumulates quickly across iterations if left until chroot teardown.
+    snapshot.delete()
 
     return row
 

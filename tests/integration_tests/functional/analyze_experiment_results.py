@@ -26,6 +26,12 @@ DEFAULT_CSV = os.path.join(_repo_root(), "test_results", "experiment_results.csv
 
 MEM_SIZES = [256, 512, 1024, 2048, 4096]
 WORKLOADS = ["idle", "light", "medium", "heavy"]
+APP_MEM_SIZES = [512, 2048]
+APP_WORKLOADS = [
+    "redis_light", "redis_mixed", "redis_heavy",
+    "memcached_light", "memcached_heavy",
+]
+STREAM_KERNELS = ["copy", "scale", "add", "triad"]
 
 
 def load_csv(path):
@@ -376,6 +382,180 @@ def print_key_findings(grouped):
         print(f"  {mem:>4} MiB: wp_enable = {wp/1000:.1f} ms ({pct:.0f}% of freeze)")
 
 
+def print_app_ops_table(grouped):
+    """Print ops/sec for Redis and Memcached: baseline / during / post per mode."""
+    has_data = any(k[1] in APP_WORKLOADS for k in grouped)
+    if not has_data:
+        print("\n[No app workload data in CSV — skipping app ops table]")
+        return
+
+    print()
+    print("APPLICATION OPS/SEC — BASELINE / DURING / POST SNAPSHOT")
+    print("=" * 100)
+    print(
+        f"{'Workload':>18}  {'Mem':>5}  {'Mode':>5}  "
+        f"{'Baseline':>10}  {'During':>10}  {'Post':>10}  {'Degrad%':>8}"
+    )
+    print("-" * 100)
+
+    for wl in APP_WORKLOADS:
+        for mem in APP_MEM_SIZES:
+            for mode in ["full", "live"]:
+                rr = grouped.get((mem, wl, mode), [])
+                if not rr:
+                    continue
+                b_ops  = avg([r.get("app_baseline_ops", 0) for r in rr])
+                d_ops  = avg([r.get("app_during_ops",   0) for r in rr])
+                p_ops  = avg([r.get("post_snap_ops",    0) for r in rr])
+                degrad = avg([r.get("app_ops_degradation_pct", 0) for r in rr])
+                print(
+                    f"{wl:>18}  {mem:>5}  {mode:>5}  "
+                    f"{b_ops:>10.0f}  {d_ops:>10.0f}  {p_ops:>10.0f}  {degrad:>7.1f}"
+                )
+        print()
+
+
+def print_app_latency_table(grouped):
+    """Print avg and p99 latency for Redis/Memcached: baseline / during / post."""
+    has_data = any(k[1] in APP_WORKLOADS for k in grouped)
+    if not has_data:
+        print("\n[No app workload data in CSV — skipping app latency table]")
+        return
+
+    print()
+    print("APPLICATION LATENCY (µs) — AVG and P99 PER WINDOW")
+    print("=" * 120)
+    print(
+        f"{'Workload':>18}  {'Mem':>5}  {'Mode':>5}  "
+        f"{'Avg-Base':>10}  {'Avg-Dur':>9}  {'Avg-Post':>9}  "
+        f"{'p99-Base':>10}  {'p99-Dur':>9}  {'p99-Post':>9}"
+    )
+    print("-" * 120)
+
+    for wl in APP_WORKLOADS:
+        for mem in APP_MEM_SIZES:
+            for mode in ["full", "live"]:
+                rr = grouped.get((mem, wl, mode), [])
+                if not rr:
+                    continue
+                avg_b  = avg([r.get("app_baseline_avg_us", 0) for r in rr])
+                avg_d  = avg([r.get("app_during_avg_us",  0) for r in rr])
+                avg_p  = avg([r.get("post_snap_avg_us",   0) for r in rr])
+                p99_b  = avg([r.get("app_baseline_p99_us", 0) for r in rr])
+                p99_d  = avg([r.get("app_during_p99_us",  0) for r in rr])
+                p99_p  = avg([r.get("post_snap_p99_us",   0) for r in rr])
+                print(
+                    f"{wl:>18}  {mem:>5}  {mode:>5}  "
+                    f"{avg_b:>10.0f}  {avg_d:>9.0f}  {avg_p:>9.0f}  "
+                    f"{p99_b:>10.0f}  {p99_d:>9.0f}  {p99_p:>9.0f}"
+                )
+        print()
+
+
+def print_stream_table(grouped):
+    """Print STREAM Triad bandwidth: baseline / during / post for both modes."""
+    has_data = any(k[1] == "stream" for k in grouped)
+    if not has_data:
+        print("\n[No STREAM workload data in CSV — skipping STREAM table]")
+        return
+
+    print()
+    print("STREAM BENCHMARK — TRIAD BANDWIDTH (MiB/s): BASELINE / DURING / POST")
+    print("=" * 90)
+    print(
+        f"{'Mem':>5}  {'Mode':>5}  "
+        f"{'Base-Copy':>10}  {'Base-Triad':>11}  "
+        f"{'Dur-Triad':>10}  {'Post-Triad':>11}  "
+        f"{'Degrad%':>8}  {'OvrlMean':>9}  {'OvrlStd':>8}"
+    )
+    print("-" * 90)
+
+    for mem in APP_MEM_SIZES:
+        for mode in ["full", "live"]:
+            rr = grouped.get((mem, "stream", mode), [])
+            if not rr:
+                continue
+            b_copy  = avg([r.get("stream_baseline_copy_mibs",  0) for r in rr])
+            b_triad = avg([r.get("stream_baseline_triad_mibs", 0) for r in rr])
+            d_triad = avg([r.get("stream_during_triad_mibs",   0) for r in rr])
+            p_triad = avg([r.get("stream_post_triad_mibs",     0) for r in rr])
+            degrad  = avg([r.get("stream_triad_degradation_pct", 0) for r in rr])
+            ov_mean = avg([r.get("overall_triad_mean_mibs",    0) for r in rr])
+            ov_std  = avg([r.get("overall_triad_stddev_mibs",  0) for r in rr])
+            print(
+                f"{mem:>5}  {mode:>5}  "
+                f"{b_copy:>10.0f}  {b_triad:>11.0f}  "
+                f"{d_triad:>10.0f}  {p_triad:>11.0f}  "
+                f"{degrad:>7.1f}  {ov_mean:>9.0f}  {ov_std:>8.0f}"
+            )
+        if mem < APP_MEM_SIZES[-1]:
+            print()
+
+
+def print_overall_stats_table(grouped):
+    """Print overall run aggregates (mean ± stddev across all three windows)."""
+    # Show synthetic workloads (throughput) and app workloads (ops + latency).
+    print()
+    print("OVERALL RUN STATISTICS — MEAN ± STDDEV ACROSS PRE/DURING/POST WINDOWS")
+
+    # Synthetic: throughput
+    syn_data = any(
+        grouped.get((m, wl, mode), [])
+        for m in MEM_SIZES for wl in WORKLOADS if wl != "idle"
+        for mode in ["full", "live"]
+    )
+    if syn_data:
+        print()
+        print("  Synthetic workloads — overall throughput (MiB/s):")
+        print(
+            f"  {'Mem':>5}  {'Workload':>8}  {'Mode':>5}  "
+            f"{'Mean':>9}  {'Stddev':>8}"
+        )
+        print("  " + "-" * 50)
+        for mem in MEM_SIZES:
+            for wl in [w for w in WORKLOADS if w != "idle"]:
+                for mode in ["full", "live"]:
+                    rr = grouped.get((mem, wl, mode), [])
+                    if not rr:
+                        continue
+                    m_val = avg([r.get("overall_throughput_mean_mibs",   0) for r in rr])
+                    s_val = avg([r.get("overall_throughput_stddev_mibs", 0) for r in rr])
+                    print(f"  {mem:>5}  {wl:>8}  {mode:>5}  {m_val:>9.1f}  {s_val:>8.1f}")
+            print()
+
+    # App workloads: ops + latency
+    has_app = any(k[1] in APP_WORKLOADS for k in grouped)
+    if has_app:
+        print()
+        print("  Application workloads — overall ops/sec and latency (µs):")
+        print(
+            f"  {'Workload':>18}  {'Mem':>5}  {'Mode':>5}  "
+            f"{'Ops mean':>9}  {'±std':>7}  "
+            f"{'AvgLat mean':>12}  {'±std':>7}  "
+            f"{'p99 mean':>9}  {'±std':>7}"
+        )
+        print("  " + "-" * 90)
+        for wl in APP_WORKLOADS:
+            for mem in APP_MEM_SIZES:
+                for mode in ["full", "live"]:
+                    rr = grouped.get((mem, wl, mode), [])
+                    if not rr:
+                        continue
+                    ops_m  = avg([r.get("overall_ops_mean",              0) for r in rr])
+                    ops_s  = avg([r.get("overall_ops_stddev",            0) for r in rr])
+                    lat_m  = avg([r.get("overall_avg_latency_us_mean",   0) for r in rr])
+                    lat_s  = avg([r.get("overall_avg_latency_us_stddev", 0) for r in rr])
+                    p99_m  = avg([r.get("overall_p99_us_mean",           0) for r in rr])
+                    p99_s  = avg([r.get("overall_p99_us_stddev",         0) for r in rr])
+                    print(
+                        f"  {wl:>18}  {mem:>5}  {mode:>5}  "
+                        f"{ops_m:>9.0f}  {ops_s:>7.0f}  "
+                        f"{lat_m:>12.0f}  {lat_s:>7.0f}  "
+                        f"{p99_m:>9.0f}  {p99_s:>7.0f}"
+                    )
+            print()
+
+
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
 
@@ -400,6 +580,10 @@ def main():
     print_restore_table(grouped)
     print_host_resources(grouped)
     print_key_findings(grouped)
+    print_app_ops_table(grouped)
+    print_app_latency_table(grouped)
+    print_stream_table(grouped)
+    print_overall_stats_table(grouped)
 
 
 if __name__ == "__main__":
