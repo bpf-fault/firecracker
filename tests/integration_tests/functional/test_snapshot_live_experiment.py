@@ -135,6 +135,7 @@ CSV_FIELDS = [
     "overall_p99_us_mean", "overall_p99_us_stddev",
     "overall_throughput_mean_mibs", "overall_throughput_stddev_mibs",
     "overall_triad_mean_mibs", "overall_triad_stddev_mibs",
+    "service_interruption_ms",   # time server was fully unresponsive (full=full_total_ms, live=downtime_us/1000)
     # STREAM benchmark — per-window
     "stream_baseline_copy_mibs",  "stream_baseline_scale_mibs",
     "stream_baseline_add_mibs",   "stream_baseline_triad_mibs",
@@ -1097,8 +1098,9 @@ def _run_full_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
     post_snap_mibs = _measure_workload_throughput(rvm, workload)
     row["post_snap_throughput_mibs"] = round(post_snap_mibs, 2)
 
-    # Overall stats across [baseline, during=0 (paused), post] windows.
-    overall_vals = [baseline_mibs, 0.0, post_snap_mibs]
+    # Overall stats across [baseline, post] windows (during=0 skipped — VM was paused).
+    overall_vals = [baseline_mibs, post_snap_mibs]
+    row["service_interruption_ms"] = round(row["full_total_ms"], 2)
     mean, stddev, _, _ = _compute_overall_stats(overall_vals)
     row["overall_throughput_mean_mibs"] = round(mean, 2)
     row["overall_throughput_stddev_mibs"] = round(stddev, 2)
@@ -1193,6 +1195,7 @@ def _run_live_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
         mean, stddev, _, _ = _compute_overall_stats(overall_vals)
         row["overall_throughput_mean_mibs"] = round(mean, 2)
         row["overall_throughput_stddev_mibs"] = round(stddev, 2)
+        row["service_interruption_ms"] = round(row.get("downtime_us", 0) / 1000, 2)
     else:
         row["workload_during_mibs"] = 0
         row["workload_degradation_pct"] = 0
@@ -1306,10 +1309,10 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         row["post_snap_p50_us"] = round(ps_p50, 1)
         row["post_snap_p99_us"] = round(ps_p99, 1)
         row["post_snap_p999_us"] = round(ps_p999, 1)
-        # Overall stats: during=0 (paused), so use [baseline, 0, post].
-        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, 0.0, ps_ops])
-        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, 0.0, ps_avg])
-        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, 0.0, ps_p99])
+        # Overall stats: during window excluded (VM was paused), use [baseline, post].
+        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, ps_ops])
+        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, ps_avg])
+        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, ps_p99])
         row["overall_ops_mean"]             = round(mean_ops, 1)
         row["overall_ops_stddev"]           = round(std_ops, 1)
         row["overall_ops_min"]              = round(min_ops, 1)
@@ -1318,6 +1321,7 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         row["overall_avg_latency_us_stddev"] = round(std_avg, 1)
         row["overall_p99_us_mean"]          = round(mean_p99, 1)
         row["overall_p99_us_stddev"]        = round(std_p99, 1)
+        row["service_interruption_ms"] = round(row["full_total_ms"], 2)
     elif _is_memcached_workload(workload):
         ps_ops, ps_avg, ps_p50, ps_p99, ps_p999 = _measure_post_snapshot_memcached(rvm, workload)
         row["post_snap_ops"]    = round(ps_ops, 1)
@@ -1325,9 +1329,10 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         row["post_snap_p50_us"] = round(ps_p50, 1)
         row["post_snap_p99_us"] = round(ps_p99, 1)
         row["post_snap_p999_us"] = round(ps_p999, 1)
-        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, 0.0, ps_ops])
-        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, 0.0, ps_avg])
-        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, 0.0, ps_p99])
+        # Overall stats: during window excluded (VM was paused), use [baseline, post].
+        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, ps_ops])
+        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, ps_avg])
+        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, ps_p99])
         row["overall_ops_mean"]             = round(mean_ops, 1)
         row["overall_ops_stddev"]           = round(std_ops, 1)
         row["overall_ops_min"]              = round(min_ops, 1)
@@ -1336,6 +1341,7 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         row["overall_avg_latency_us_stddev"] = round(std_avg, 1)
         row["overall_p99_us_mean"]          = round(mean_p99, 1)
         row["overall_p99_us_stddev"]        = round(std_p99, 1)
+        row["service_interruption_ms"] = round(row["full_total_ms"], 2)
     elif _is_stream_workload(workload):
         ps_copy, ps_scale, ps_add, ps_triad = _run_stream_benchmark(rvm)
         row["stream_post_copy_mibs"]  = round(ps_copy, 1)
@@ -1343,10 +1349,11 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         row["stream_post_add_mibs"]   = round(ps_add, 1)
         row["stream_post_triad_mibs"] = round(ps_triad, 1)
         b_triad = row.get("stream_baseline_triad_mibs", 0)
-        # Overall triad across [baseline, 0 (paused), post].
-        mean_tr, std_tr, _, _ = _compute_overall_stats([b_triad, 0.0, ps_triad])
+        # Overall triad: during window excluded (VM was paused), use [baseline, post].
+        mean_tr, std_tr, _, _ = _compute_overall_stats([b_triad, ps_triad])
         row["overall_triad_mean_mibs"]   = round(mean_tr, 1)
         row["overall_triad_stddev_mibs"] = round(std_tr, 1)
+        row["service_interruption_ms"] = round(row["full_total_ms"], 2)
 
     rvm.kill()
 
@@ -1415,6 +1422,7 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     # Parse Firecracker log for phase breakdown.
     live_metrics = _parse_live_snapshot_log(vm.log_data)
     row.update(live_metrics)
+    row["service_interruption_ms"] = round(live_metrics.get("downtime_us", 0) / 1000, 2)
 
     total_pages = live_metrics.get("total_pages", 0)
     fault_pages = live_metrics.get("fault_pages", 0)

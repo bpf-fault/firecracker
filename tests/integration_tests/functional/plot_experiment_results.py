@@ -630,8 +630,30 @@ def plot_fault_fraction_comparison(grouped, outdir):
 # ---------------------------------------------------------------------------
 
 
+def _corrected_overall_lat(grouped, mem, wl, mode, baseline_field, during_field, post_field):
+    """Recompute overall latency excluding the zero-during window for full snapshot.
+
+    For full snapshot the VM was paused, so there are no real during-window
+    measurements. We average only baseline and post to avoid pulling the mean
+    down with a fake zero.
+    """
+    rr = grouped.get((mem, wl, mode), [])
+    if not rr:
+        return 0.0
+    b = avg([r.get(baseline_field, 0) for r in rr])
+    p = avg([r.get(post_field, 0) for r in rr])
+    if mode == "full":
+        return (b + p) / 2
+    d = avg([r.get(during_field, 0) for r in rr])
+    return (b + d + p) / 3
+
+
 def plot_overall_avg_latency(grouped, outdir):
-    """Bar+error chart of overall_avg_latency_us_mean ± stddev for app workloads."""
+    """Bar chart of corrected overall latency for app workloads (full vs live).
+
+    For full snapshot the during-window is excluded because the VM was paused
+    and served no requests — including 0 would artificially lower the mean.
+    """
     if not any(k[1] in APP_WORKLOADS for k in grouped):
         print("  Skipping plot 13: no app workload data in CSV")
         return
@@ -648,31 +670,30 @@ def plot_overall_avg_latency(grouped, outdir):
         ("live", 2048,  1.5, "#1565C0"),
     ]
 
-    for ax, metric, ylabel, title in [
-        (axes[0], "overall_avg_latency_us", "Overall Avg Latency (µs)", "Average Latency"),
-        (axes[1], "overall_p99_us",         "Overall p99 Latency (µs)", "p99 Latency"),
+    for ax, baseline_f, during_f, post_f, ylabel, title in [
+        (axes[0], "app_baseline_avg_us", "app_during_avg_us", "post_snap_avg_us",
+         "Overall Avg Latency (µs)", "Average Latency"),
+        (axes[1], "app_baseline_p99_us", "app_during_p99_us", "post_snap_p99_us",
+         "Overall p99 Latency (µs)", "p99 Latency"),
     ]:
-        mean_field = f"{metric}_mean"
-        std_field  = f"{metric}_stddev"
-
         for mode, mem, offset, color in config:
-            means  = []
-            errors = []
-            for wl in APP_WORKLOADS:
-                rr = grouped.get((mem, wl, mode), [])
-                means.append( avg([r.get(mean_field, 0) for r in rr]))
-                errors.append(avg([r.get(std_field,  0) for r in rr]))
+            means = [
+                _corrected_overall_lat(grouped, mem, wl, mode, baseline_f, during_f, post_f)
+                for wl in APP_WORKLOADS
+            ]
             ax.bar(
                 [xi + offset * width for xi in x], means, width,
-                yerr=errors, capsize=3,
                 label=f"{mode.capitalize()} {mem} MiB",
-                color=color, edgecolor="white", error_kw={"elinewidth": 1.2},
+                color=color, edgecolor="white",
             )
 
         ax.set_xlabel("Application Workload", fontsize=11)
         ax.set_ylabel(ylabel, fontsize=11)
-        ax.set_title(f"Overall Run {title} (mean ± stddev, full vs live)",
-                     fontsize=12, fontweight="bold")
+        ax.set_title(
+            f"Overall Run {title}\n"
+            "(during window excluded for full — VM was paused)",
+            fontsize=11, fontweight="bold",
+        )
         ax.set_xticks(x)
         ax.set_xticklabels([w.replace("_", "\n") for w in APP_WORKLOADS], fontsize=8)
         ax.legend(fontsize=9)
@@ -748,6 +769,84 @@ def plot_three_window_throughput(grouped, outdir):
 
 
 # ---------------------------------------------------------------------------
+# Plot 15: Service interruption — full vs live
+# ---------------------------------------------------------------------------
+
+
+def plot_service_interruption(grouped, outdir):
+    """Bar chart: service interruption (ms) for full vs live snapshot.
+
+    Full snapshot: server is completely unresponsive for the entire snapshot
+    duration (VM paused). Live snapshot: server is only unresponsive for the
+    brief freeze/downtime window.
+    """
+    all_workloads = [wl for wl in WORKLOADS if wl != "idle"] + APP_WORKLOADS
+    all_mems = sorted({m for (m, wl, mode) in grouped
+                       if wl in all_workloads})
+    if not all_mems:
+        print("  Skipping plot 15: no workload data for service interruption")
+        return
+
+    # Collect per-memory-size averages across workloads.
+    full_ms_by_mem = []
+    live_ms_by_mem = []
+    valid_mems = []
+
+    for mem in sorted(set(MEM_SIZES + APP_MEM_SIZES)):
+        full_vals = []
+        live_vals = []
+        for wl in all_workloads:
+            full_rr = grouped.get((mem, wl, "full"), [])
+            live_rr = grouped.get((mem, wl, "live"), [])
+            if full_rr:
+                si = [r.get("service_interruption_ms") for r in full_rr
+                      if r.get("service_interruption_ms")]
+                if si:
+                    full_vals.append(avg(si))
+                else:
+                    full_vals.append(avg([r["full_total_ms"] for r in full_rr]))
+            if live_rr:
+                si = [r.get("service_interruption_ms") for r in live_rr
+                      if r.get("service_interruption_ms")]
+                if si:
+                    live_vals.append(avg(si))
+                else:
+                    live_vals.append(avg([r["downtime_us"] for r in live_rr]) / 1000)
+        if full_vals or live_vals:
+            full_ms_by_mem.append(sum(full_vals) / len(full_vals) if full_vals else 0)
+            live_ms_by_mem.append(sum(live_vals) / len(live_vals) if live_vals else 0)
+            valid_mems.append(mem)
+
+    if not valid_mems:
+        print("  Skipping plot 15: insufficient data")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = range(len(valid_mems))
+    width = 0.35
+
+    ax.bar([xi - width / 2 for xi in x], full_ms_by_mem, width,
+           label="Full snapshot", color=FULL_COLOR, edgecolor="white")
+    ax.bar([xi + width / 2 for xi in x], live_ms_by_mem, width,
+           label="Live snapshot (downtime only)", color=LIVE_COLOR, edgecolor="white")
+
+    ax.set_xlabel("VM Memory Size (MiB)", fontsize=12)
+    ax.set_ylabel("Service Interruption (ms)", fontsize=12)
+    ax.set_title(
+        "Service Interruption: Full vs Live Snapshot\n"
+        "(time server was fully unresponsive)",
+        fontsize=13, fontweight="bold",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(valid_mems)
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.set_ylim(bottom=0)
+
+    _savefig(fig, outdir, "15_service_interruption.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -780,9 +879,10 @@ def main():
     plot_fault_fraction_comparison(grouped, outdir)
     plot_overall_avg_latency(grouped, outdir)
     plot_three_window_throughput(grouped, outdir)
+    plot_service_interruption(grouped, outdir)
 
     print()
-    print(f"Done! {14} plots saved to {outdir}/")
+    print(f"Done! {15} plots saved to {outdir}/")
 
 
 if __name__ == "__main__":

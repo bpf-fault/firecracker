@@ -492,11 +492,40 @@ def print_stream_table(grouped):
             print()
 
 
+def corrected_overall_avg(grouped, mem, wl, mode, metric_base, post_field):
+    """Recompute overall latency/ops excluding the zero-during window for full snapshot.
+
+    For full snapshot, the VM was paused so there are no real during-window
+    measurements. Averaging in 0.0 from the paused window artificially lowers
+    the mean. Instead, average only the baseline and post windows.
+    """
+    rr = grouped.get((mem, wl, mode), [])
+    if not rr:
+        return 0.0, 0.0
+    b_vals = [float(r.get(f"app_baseline_{metric_base}", 0) or 0) for r in rr]
+    p_vals = [float(r.get(post_field, 0) or 0) for r in rr]
+    b = sum(b_vals) / len(b_vals) if b_vals else 0.0
+    p = sum(p_vals) / len(p_vals) if p_vals else 0.0
+    if mode == "full":
+        corrected = (b + p) / 2
+    else:
+        d_vals = [float(r.get(f"app_during_{metric_base}", 0) or 0) for r in rr]
+        d = sum(d_vals) / len(d_vals) if d_vals else 0.0
+        corrected = (b + d + p) / 3
+    return corrected
+
+
 def print_overall_stats_table(grouped):
-    """Print overall run aggregates (mean ± stddev across all three windows)."""
+    """Print overall run aggregates (mean ± stddev across pre/during/post windows).
+
+    For full snapshot, the during-window value is excluded from the average
+    because the VM was paused and served no requests during that window.
+    Averaging in 0 would artificially lower the full snapshot mean.
+    """
     # Show synthetic workloads (throughput) and app workloads (ops + latency).
     print()
     print("OVERALL RUN STATISTICS — MEAN ± STDDEV ACROSS PRE/DURING/POST WINDOWS")
+    print("  NOTE: full snapshot during-window excluded from averages (VM was paused)")
 
     # Synthetic: throughput
     syn_data = any(
@@ -528,32 +557,93 @@ def print_overall_stats_table(grouped):
     if has_app:
         print()
         print("  Application workloads — overall ops/sec and latency (µs):")
+        print("  (corrected: full snapshot excludes zero-during window)")
         print(
             f"  {'Workload':>18}  {'Mem':>5}  {'Mode':>5}  "
-            f"{'Ops mean':>9}  {'±std':>7}  "
-            f"{'AvgLat mean':>12}  {'±std':>7}  "
-            f"{'p99 mean':>9}  {'±std':>7}"
+            f"{'AvgLat(corr)':>13}  {'p99(corr)':>10}"
         )
-        print("  " + "-" * 90)
+        print("  " + "-" * 70)
         for wl in APP_WORKLOADS:
             for mem in APP_MEM_SIZES:
                 for mode in ["full", "live"]:
                     rr = grouped.get((mem, wl, mode), [])
                     if not rr:
                         continue
-                    ops_m  = avg([r.get("overall_ops_mean",              0) for r in rr])
-                    ops_s  = avg([r.get("overall_ops_stddev",            0) for r in rr])
-                    lat_m  = avg([r.get("overall_avg_latency_us_mean",   0) for r in rr])
-                    lat_s  = avg([r.get("overall_avg_latency_us_stddev", 0) for r in rr])
-                    p99_m  = avg([r.get("overall_p99_us_mean",           0) for r in rr])
-                    p99_s  = avg([r.get("overall_p99_us_stddev",         0) for r in rr])
+                    lat_m = corrected_overall_avg(grouped, mem, wl, mode, "avg_us", "post_snap_avg_us")
+                    p99_m = corrected_overall_avg(grouped, mem, wl, mode, "p99_us", "post_snap_p99_us")
                     print(
                         f"  {wl:>18}  {mem:>5}  {mode:>5}  "
-                        f"{ops_m:>9.0f}  {ops_s:>7.0f}  "
-                        f"{lat_m:>12.0f}  {lat_s:>7.0f}  "
-                        f"{p99_m:>9.0f}  {p99_s:>7.0f}"
+                        f"{lat_m:>13.0f}  {p99_m:>10.0f}"
                     )
             print()
+
+
+def print_service_interruption_table(grouped):
+    """Print service interruption duration: time server was fully unresponsive.
+
+    For full snapshot this equals the total snapshot time (VM was paused).
+    For live snapshot this equals the freeze/downtime window only.
+    """
+    all_workloads = [wl for wl in WORKLOADS if wl != "idle"] + APP_WORKLOADS + ["stream"]
+    all_mems = MEM_SIZES + [m for m in APP_MEM_SIZES if m not in MEM_SIZES]
+
+    has_data = False
+    for wl in all_workloads:
+        for mem in all_mems:
+            if grouped.get((mem, wl, "full"), []) or grouped.get((mem, wl, "live"), []):
+                has_data = True
+                break
+
+    if not has_data:
+        print("\n[No workload data for service interruption table]")
+        return
+
+    print()
+    print("SERVICE INTERRUPTION (ms) — time server was fully unresponsive")
+    print("=" * 70)
+    print(
+        f"{'Mem(MiB)':>10}  {'Workload':>18}  {'Full (ms)':>10}  "
+        f"{'Live (ms)':>10}  {'Ratio':>7}"
+    )
+    print("-" * 70)
+
+    for wl in all_workloads:
+        for mem in all_mems:
+            full_rr = grouped.get((mem, wl, "full"), [])
+            live_rr = grouped.get((mem, wl, "live"), [])
+            if not full_rr and not live_rr:
+                continue
+
+            # Full: use service_interruption_ms if present, else fall back to full_total_ms.
+            if full_rr:
+                si_vals = [r.get("service_interruption_ms") for r in full_rr
+                           if r.get("service_interruption_ms")]
+                if si_vals:
+                    full_ms = avg(si_vals)
+                else:
+                    full_ms = avg([r["full_total_ms"] for r in full_rr])
+            else:
+                full_ms = 0.0
+
+            # Live: use service_interruption_ms if present, else fall back to downtime_us.
+            if live_rr:
+                si_vals = [r.get("service_interruption_ms") for r in live_rr
+                           if r.get("service_interruption_ms")]
+                if si_vals:
+                    live_ms = avg(si_vals)
+                else:
+                    live_ms = avg([r["downtime_us"] for r in live_rr]) / 1000
+            else:
+                live_ms = 0.0
+
+            ratio = full_ms / live_ms if live_ms > 0 else float("inf")
+            ratio_str = f"{ratio:.1f}x" if ratio != float("inf") else "inf"
+
+            print(
+                f"{mem:>10}  {wl:>18}  {full_ms:>9.1f}  "
+                f"{live_ms:>9.1f}  {ratio_str:>7}"
+            )
+        print()
 
 
 def main():
@@ -584,6 +674,7 @@ def main():
     print_app_latency_table(grouped)
     print_stream_table(grouped)
     print_overall_stats_table(grouped)
+    print_service_interruption_table(grouped)
 
 
 if __name__ == "__main__":
