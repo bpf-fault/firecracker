@@ -13,8 +13,10 @@ See docs/live_snapshot/live-snapshot-experiment-design.md for full design.
 
 import csv
 import logging
+import math
 import os
 import re
+import statistics
 import time
 from pathlib import Path
 
@@ -116,22 +118,74 @@ CSV_FIELDS = [
     "workload_during_mibs",
     "workload_degradation_pct",
     "actual_write_rate_mibs",
-    # Application workloads (Redis / Memcached)
-    "app_baseline_ops", "app_during_ops", "app_ops_degradation_pct",
+    # Application workloads (Redis / Memcached) — per-window
+    "app_baseline_ops", "app_baseline_avg_us",
     "app_baseline_p50_us", "app_baseline_p99_us", "app_baseline_p999_us",
+    "app_during_ops", "app_during_avg_us",
     "app_during_p50_us",  "app_during_p99_us",  "app_during_p999_us",
-    # STREAM benchmark
+    "app_ops_degradation_pct",
+    # Post-snapshot measurements
+    "post_snap_ops", "post_snap_avg_us",
+    "post_snap_p50_us", "post_snap_p99_us", "post_snap_p999_us",
+    "post_snap_throughput_mibs",
+    # Overall run aggregates (across pre/during/post windows)
+    "overall_ops_mean", "overall_ops_stddev",
+    "overall_ops_min", "overall_ops_max",
+    "overall_avg_latency_us_mean", "overall_avg_latency_us_stddev",
+    "overall_p99_us_mean", "overall_p99_us_stddev",
+    "overall_throughput_mean_mibs", "overall_throughput_stddev_mibs",
+    "overall_triad_mean_mibs", "overall_triad_stddev_mibs",
+    # STREAM benchmark — per-window
     "stream_baseline_copy_mibs",  "stream_baseline_scale_mibs",
     "stream_baseline_add_mibs",   "stream_baseline_triad_mibs",
     "stream_during_copy_mibs",    "stream_during_scale_mibs",
     "stream_during_add_mibs",     "stream_during_triad_mibs",
     "stream_triad_degradation_pct",
+    "stream_post_copy_mibs", "stream_post_scale_mibs",
+    "stream_post_add_mibs",  "stream_post_triad_mibs",
 ]
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _compute_overall_stats(values):
+    """Compute (mean, stddev, min, max) from a list of finite floats.
+
+    Filters out None, NaN, and non-finite values before computing. Returns
+    (0.0, 0.0, 0.0, 0.0) if fewer than one valid value remains; stddev is
+    0.0 when fewer than two valid values are present.
+    """
+    valid = [v for v in values if v is not None and math.isfinite(v)]
+    if not valid:
+        return 0.0, 0.0, 0.0, 0.0
+    mean = statistics.mean(valid)
+    stddev = statistics.stdev(valid) if len(valid) >= 2 else 0.0
+    return mean, stddev, min(valid), max(valid)
+
+
+def _parse_stream_log_all_runs(log_text):
+    """Parse all completed STREAM benchmark runs from a cumulative log.
+
+    Each run prints Copy/Scale/Add/Triad lines. Returns a list of dicts
+    with keys "copy", "scale", "add", "triad" in MiB/s (converted from
+    the MB/s values STREAM reports).
+    """
+    runs = []
+    mb_to_mib = 1e6 / (1024 * 1024)
+    # Split log into individual invocation blocks on the STREAM header line.
+    blocks = re.split(r"-------------------------------------------------------------", log_text)
+    for block in blocks:
+        result = {}
+        for kernel in ("Copy", "Scale", "Add", "Triad"):
+            m = re.search(rf"^{kernel}:\s+([\d.]+)", block, re.MULTILINE | re.IGNORECASE)
+            if m:
+                result[kernel.lower()] = float(m.group(1)) * mb_to_mib
+        if len(result) == 4:
+            runs.append(result)
+    return runs
 
 
 def _parse_live_snapshot_log(log_data):
@@ -459,15 +513,30 @@ def _setup_redis(vm, mem_size_mib):
 def _parse_redis_benchmark_output(output):
     """Parse redis-benchmark verbose output.
 
-    Returns (ops_per_sec, p50_us, p99_us, p999_us).  Missing values default
-    to 0.0.
+    Returns (ops_per_sec, avg_us, p50_us, p99_us, p999_us).  Missing
+    values default to 0.0.  avg_us is extracted from the "latency summary"
+    table printed by redis-benchmark >= 6.x; falls back to 0.0 on older
+    versions that do not emit that section.
     """
     ops = 0.0
-    p50 = p99 = p999 = 0.0
+    avg_us = p50 = p99 = p999 = 0.0
 
     m = re.search(r"([\d.]+) requests per second", output)
     if m:
         ops = float(m.group(1))
+
+    # Average latency from the "latency summary" block (redis-benchmark >= 6).
+    # Format:
+    #   latency summary (msec):
+    #           avg       min       p50  ...
+    #         0.083     0.032     0.079  ...
+    m = re.search(
+        r"latency summary \(msec\):\s+avg\s+\S.*?\n\s+([\d.]+)",
+        output,
+        re.DOTALL,
+    )
+    if m:
+        avg_us = float(m.group(1)) * 1000
 
     # Histogram lines: "  50.00% <= 0.103 milliseconds"
     # redis-benchmark uses power-of-2 percentile buckets (50, 75, 87.5,
@@ -487,11 +556,11 @@ def _parse_redis_benchmark_output(output):
         elif pct >= 99.9 and p999 == 0.0:
             p999 = lat_ms * 1000
 
-    return ops, p50, p99, p999
+    return ops, avg_us, p50, p99, p999
 
 
 def _measure_redis_baseline(vm, workload):
-    """Run a 50 000-op redis-benchmark and return (ops, p50, p99, p999)."""
+    """Run a 50 000-op redis-benchmark and return (ops, avg_us, p50, p99, p999)."""
     params = REDIS_WORKLOAD_PARAMS[workload]
     clients = params["clients"]
     ops_arg = params["ops"]
@@ -501,6 +570,14 @@ def _measure_redis_baseline(vm, workload):
         timeout=60,
     )
     return _parse_redis_benchmark_output(out)
+
+
+def _measure_post_snapshot_redis(vm, workload):
+    """Run a post-snapshot redis-benchmark burst to measure recovery performance.
+
+    Returns (ops, avg_us, p50, p99, p999).
+    """
+    return _measure_redis_baseline(vm, workload)
 
 
 def _start_redis_background_workload(vm, workload):
@@ -577,7 +654,8 @@ def _setup_memcached(vm, mem_size_mib):
     vm.ssh.check_output(
         "memtier_benchmark -p 11211 --protocol=memcache_text "
         "--key-maximum=500000 --data-size=512 "
-        "-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram -q",
+        "-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram "
+        "--key-pattern=P:P",
         timeout=120,
     )
 
@@ -585,11 +663,12 @@ def _setup_memcached(vm, mem_size_mib):
 def _parse_memtier_output(output):
     """Parse memtier_benchmark summary output.
 
-    Finds the 'Totals' line and extracts ops/sec and latency percentiles.
-    Returns (ops, p50_us, p99_us, p999_us).
+    Finds the 'Totals' line and extracts ops/sec, average latency, and
+    latency percentiles.
+    Returns (ops, avg_us, p50_us, p99_us, p999_us).
     """
     ops = 0.0
-    p50 = p99 = p999 = 0.0
+    avg_us = p50 = p99 = p999 = 0.0
 
     for line in output.splitlines():
         if "Totals" not in line:
@@ -598,20 +677,21 @@ def _parse_memtier_output(output):
         # Columns: Type  Ops/sec  Hits/sec  Miss/sec  Avg Lat  p50   p99   p99.9  ...
         # Indices:   0      1        2         3         4      5     6      7
         try:
-            ops = float(parts[1])
+            ops    = float(parts[1])
             # latency columns are in milliseconds; convert to microseconds
-            p50  = float(parts[5]) * 1000
-            p99  = float(parts[6]) * 1000
-            p999 = float(parts[7]) * 1000
+            avg_us = float(parts[4]) * 1000
+            p50    = float(parts[5]) * 1000
+            p99    = float(parts[6]) * 1000
+            p999   = float(parts[7]) * 1000
         except (IndexError, ValueError):
             pass
         break
 
-    return ops, p50, p99, p999
+    return ops, avg_us, p50, p99, p999
 
 
 def _measure_memcached_baseline(vm, workload):
-    """Run a 10-second memtier benchmark and return (ops, p50, p99, p999)."""
+    """Run a 10-second memtier benchmark and return (ops, avg_us, p50, p99, p999)."""
     params = MEMCACHED_WORKLOAD_PARAMS[workload]
     clients = params["clients"]
     ratio = params["ratio"]
@@ -624,8 +704,21 @@ def _measure_memcached_baseline(vm, workload):
     return _parse_memtier_output(out)
 
 
+def _measure_post_snapshot_memcached(vm, workload):
+    """Run a post-snapshot memtier burst to measure recovery performance.
+
+    Returns (ops, avg_us, p50, p99, p999).
+    """
+    return _measure_memcached_baseline(vm, workload)
+
+
 def _start_memcached_background_workload(vm, workload):
-    """Launch a long-running memtier workload (600 s) in the background."""
+    """Launch a long-running memtier workload (600 s) in the background.
+
+    Output is saved to /tmp/memtier_overall.log (without -q/--hide-histogram)
+    so that the Totals line is parseable at the end of the test for overall
+    run statistics.
+    """
     params = MEMCACHED_WORKLOAD_PARAMS[workload]
     clients = params["clients"]
     ratio = params["ratio"]
@@ -633,8 +726,7 @@ def _start_memcached_background_workload(vm, workload):
     vm.ssh.check_output(
         f"nohup memtier_benchmark -p 11211 --protocol=memcache_text "
         f"-c {clients} -t 2 --ratio={ratio} --test-time=600 "
-        f"--hide-histogram -q "
-        f"</dev/null >/dev/null 2>&1 &"
+        f"</dev/null >/tmp/memtier_overall.log 2>&1 &"
     )
     time.sleep(2)
 
@@ -734,25 +826,58 @@ def _log_app_summary(row):
 
     if _is_redis_workload(wl) or _is_memcached_workload(wl):
         logger.info(
-            "  Baseline ops/sec:       %8.0f", row.get("app_baseline_ops", 0)
+            "  Baseline ops/sec:       %8.0f  (avg lat: %.0f µs)",
+            row.get("app_baseline_ops", 0),
+            row.get("app_baseline_avg_us", 0),
         )
         logger.info(
-            "  During-snap ops/sec:    %8.0f", row.get("app_during_ops", 0)
+            "  During-snap ops/sec:    %8.0f  (avg lat: %.0f µs)",
+            row.get("app_during_ops", 0),
+            row.get("app_during_avg_us", 0),
+        )
+        logger.info(
+            "  Post-snap  ops/sec:     %8.0f  (avg lat: %.0f µs)",
+            row.get("post_snap_ops", 0),
+            row.get("post_snap_avg_us", 0),
         )
         logger.info(
             "  Ops degradation:        %8.1f %%", row.get("app_ops_degradation_pct", 0)
         )
         logger.info(
-            "  Baseline latency p50/p99/p999: %.0f / %.0f / %.0f µs",
+            "  Overall ops mean/stddev: %.0f / %.0f ops/s",
+            row.get("overall_ops_mean", 0),
+            row.get("overall_ops_stddev", 0),
+        )
+        logger.info(
+            "  Overall avg lat mean/stddev: %.0f / %.0f µs",
+            row.get("overall_avg_latency_us_mean", 0),
+            row.get("overall_avg_latency_us_stddev", 0),
+        )
+        logger.info(
+            "  Overall p99  mean/stddev: %.0f / %.0f µs",
+            row.get("overall_p99_us_mean", 0),
+            row.get("overall_p99_us_stddev", 0),
+        )
+        logger.info(
+            "  Baseline latency avg/p50/p99/p999: %.0f / %.0f / %.0f / %.0f µs",
+            row.get("app_baseline_avg_us", 0),
             row.get("app_baseline_p50_us", 0),
             row.get("app_baseline_p99_us", 0),
             row.get("app_baseline_p999_us", 0),
         )
         logger.info(
-            "  During   latency p50/p99/p999: %.0f / %.0f / %.0f µs",
+            "  During   latency avg/p50/p99/p999: %.0f / %.0f / %.0f / %.0f µs",
+            row.get("app_during_avg_us", 0),
             row.get("app_during_p50_us", 0),
             row.get("app_during_p99_us", 0),
             row.get("app_during_p999_us", 0),
+        )
+        logger.info(
+            "  Post-snap latency avg/p50/p99/p999: %.0f / %.0f / %.0f / %.0f µs",
+            row.get("post_snap_avg_us", 0),
+            row.get("post_snap_p50_us", 0),
+            row.get("post_snap_p99_us", 0),
+            row.get("post_snap_p999_us", 0),
         )
     elif _is_stream_workload(wl):
         logger.info(
@@ -770,7 +895,19 @@ def _log_app_summary(row):
             row.get("stream_during_triad_mibs", 0),
         )
         logger.info(
+            "  Post-snap Copy/Scale/Add/Triad: %.0f / %.0f / %.0f / %.0f MiB/s",
+            row.get("stream_post_copy_mibs", 0),
+            row.get("stream_post_scale_mibs", 0),
+            row.get("stream_post_add_mibs", 0),
+            row.get("stream_post_triad_mibs", 0),
+        )
+        logger.info(
             "  Triad degradation:      %8.1f %%", row.get("stream_triad_degradation_pct", 0)
+        )
+        logger.info(
+            "  Overall Triad mean/stddev: %.0f / %.0f MiB/s",
+            row.get("overall_triad_mean_mibs", 0),
+            row.get("overall_triad_stddev_mibs", 0),
         )
 
     logger.info(
@@ -887,7 +1024,15 @@ def _log_summary(row):
             "  Workload during snap:   %8.1f MiB/s", row.get("workload_during_mibs", 0)
         )
         logger.info(
+            "  Workload post-snap:     %8.1f MiB/s", row.get("post_snap_throughput_mibs", 0)
+        )
+        logger.info(
             "  Workload degradation:   %8.1f %%", row.get("workload_degradation_pct", 0)
+        )
+        logger.info(
+            "  Overall throughput mean/stddev: %.1f / %.1f MiB/s",
+            row.get("overall_throughput_mean_mibs", 0),
+            row.get("overall_throughput_stddev_mibs", 0),
         )
 
     logger.info("=" * 70)
@@ -943,11 +1088,20 @@ def _run_full_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
     rvm, restore_timings = _do_restore_timed(microvm_factory, snapshot)
     row.update(restore_timings)
 
-    # Measure workload throughput on restored VM (only meaningful if workload
-    # was running, but the restored VM won't have the workload process — so
-    # this field is 0 for full snapshots since the VM was paused).
+    # Full snapshot: VM was paused, so no workload served during snapshot.
     row["workload_during_mibs"] = 0
     row["workload_degradation_pct"] = 0
+
+    # Post-snapshot: measure throughput on the restored VM (which resumed the
+    # workload process from the pre-pause state).
+    post_snap_mibs = _measure_workload_throughput(rvm, workload)
+    row["post_snap_throughput_mibs"] = round(post_snap_mibs, 2)
+
+    # Overall stats across [baseline, during=0 (paused), post] windows.
+    overall_vals = [baseline_mibs, 0.0, post_snap_mibs]
+    mean, stddev, _, _ = _compute_overall_stats(overall_vals)
+    row["overall_throughput_mean_mibs"] = round(mean, 2)
+    row["overall_throughput_stddev_mibs"] = round(stddev, 2)
 
     # Clean up restored VM.
     rvm.kill()
@@ -1028,9 +1182,23 @@ def _run_live_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration):
             )
         else:
             row["workload_degradation_pct"] = 0
+
+        # Post-snapshot: a third measurement after the snapshot has fully
+        # completed to check whether throughput recovers.
+        post_snap_mibs = _measure_workload_throughput(vm, workload)
+        row["post_snap_throughput_mibs"] = round(post_snap_mibs, 2)
+
+        # Overall stats across [baseline, during, post] windows.
+        overall_vals = [baseline_mibs, during_mibs, post_snap_mibs]
+        mean, stddev, _, _ = _compute_overall_stats(overall_vals)
+        row["overall_throughput_mean_mibs"] = round(mean, 2)
+        row["overall_throughput_stddev_mibs"] = round(stddev, 2)
     else:
         row["workload_during_mibs"] = 0
         row["workload_degradation_pct"] = 0
+        row["post_snap_throughput_mibs"] = 0
+        row["overall_throughput_mean_mibs"] = 0
+        row["overall_throughput_stddev_mibs"] = 0
 
     # VM should still be responsive.
     vm.ssh.check_output("true")
@@ -1063,15 +1231,15 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         "iteration": iteration,
     }
 
-    ops = p50 = p99 = p999 = 0.0
+    ops = avg_us = p50 = p99 = p999 = 0.0
 
     if _is_redis_workload(workload):
         _setup_redis(vm, mem_size_mib)
-        ops, p50, p99, p999 = _measure_redis_baseline(vm, workload)
+        ops, avg_us, p50, p99, p999 = _measure_redis_baseline(vm, workload)
         _start_redis_background_workload(vm, workload)
     elif _is_memcached_workload(workload):
         _setup_memcached(vm, mem_size_mib)
-        ops, p50, p99, p999 = _measure_memcached_baseline(vm, workload)
+        ops, avg_us, p50, p99, p999 = _measure_memcached_baseline(vm, workload)
         _start_memcached_background_workload(vm, workload)
     elif _is_stream_workload(workload):
         b_copy, b_scale, b_add, b_triad = _run_stream_benchmark(vm)
@@ -1082,6 +1250,7 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
 
     if _is_redis_workload(workload) or _is_memcached_workload(workload):
         row["app_baseline_ops"]     = round(ops, 1)
+        row["app_baseline_avg_us"]  = round(avg_us, 1)
         row["app_baseline_p50_us"]  = round(p50, 1)
         row["app_baseline_p99_us"]  = round(p99, 1)
         row["app_baseline_p999_us"] = round(p999, 1)
@@ -1100,25 +1269,78 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
 
     # VM is paused — no requests served during snapshot.
     if _is_redis_workload(workload) or _is_memcached_workload(workload):
-        row["app_during_ops"]            = 0
-        row["app_during_p50_us"]         = 0
-        row["app_during_p99_us"]         = 0
-        row["app_during_p999_us"]        = 0
-        row["app_ops_degradation_pct"]   = 100.0
+        row["app_during_ops"]          = 0
+        row["app_during_avg_us"]       = 0
+        row["app_during_p50_us"]       = 0
+        row["app_during_p99_us"]       = 0
+        row["app_during_p999_us"]      = 0
+        row["app_ops_degradation_pct"] = 100.0
     elif _is_stream_workload(workload):
-        row["stream_during_copy_mibs"]       = 0
-        row["stream_during_scale_mibs"]      = 0
-        row["stream_during_add_mibs"]        = 0
-        row["stream_during_triad_mibs"]      = 0
-        row["stream_triad_degradation_pct"]  = 100.0
+        row["stream_during_copy_mibs"]      = 0
+        row["stream_during_scale_mibs"]     = 0
+        row["stream_during_add_mibs"]       = 0
+        row["stream_during_triad_mibs"]     = 0
+        row["stream_triad_degradation_pct"] = 100.0
 
     row["rss_peak_kib"] = _get_peak_rss_kib(pid)
 
     mem_path = Path(vm.chroot()) / "mem"
     row["mem_file_bytes"] = mem_path.stat().st_size if mem_path.exists() else 0
 
-    _, restore_timings = _do_restore_timed(microvm_factory, snapshot)
+    rvm, restore_timings = _do_restore_timed(microvm_factory, snapshot)
     row.update(restore_timings)
+
+    # Post-snapshot: measure on the restored VM (resumed from pre-pause state).
+    if _is_redis_workload(workload):
+        ps_ops, ps_avg, ps_p50, ps_p99, ps_p999 = _measure_post_snapshot_redis(rvm, workload)
+        row["post_snap_ops"]    = round(ps_ops, 1)
+        row["post_snap_avg_us"] = round(ps_avg, 1)
+        row["post_snap_p50_us"] = round(ps_p50, 1)
+        row["post_snap_p99_us"] = round(ps_p99, 1)
+        row["post_snap_p999_us"] = round(ps_p999, 1)
+        # Overall stats: during=0 (paused), so use [baseline, 0, post].
+        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, 0.0, ps_ops])
+        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, 0.0, ps_avg])
+        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, 0.0, ps_p99])
+        row["overall_ops_mean"]             = round(mean_ops, 1)
+        row["overall_ops_stddev"]           = round(std_ops, 1)
+        row["overall_ops_min"]              = round(min_ops, 1)
+        row["overall_ops_max"]              = round(max_ops, 1)
+        row["overall_avg_latency_us_mean"]  = round(mean_avg, 1)
+        row["overall_avg_latency_us_stddev"] = round(std_avg, 1)
+        row["overall_p99_us_mean"]          = round(mean_p99, 1)
+        row["overall_p99_us_stddev"]        = round(std_p99, 1)
+    elif _is_memcached_workload(workload):
+        ps_ops, ps_avg, ps_p50, ps_p99, ps_p999 = _measure_post_snapshot_memcached(rvm, workload)
+        row["post_snap_ops"]    = round(ps_ops, 1)
+        row["post_snap_avg_us"] = round(ps_avg, 1)
+        row["post_snap_p50_us"] = round(ps_p50, 1)
+        row["post_snap_p99_us"] = round(ps_p99, 1)
+        row["post_snap_p999_us"] = round(ps_p999, 1)
+        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, 0.0, ps_ops])
+        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, 0.0, ps_avg])
+        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, 0.0, ps_p99])
+        row["overall_ops_mean"]             = round(mean_ops, 1)
+        row["overall_ops_stddev"]           = round(std_ops, 1)
+        row["overall_ops_min"]              = round(min_ops, 1)
+        row["overall_ops_max"]              = round(max_ops, 1)
+        row["overall_avg_latency_us_mean"]  = round(mean_avg, 1)
+        row["overall_avg_latency_us_stddev"] = round(std_avg, 1)
+        row["overall_p99_us_mean"]          = round(mean_p99, 1)
+        row["overall_p99_us_stddev"]        = round(std_p99, 1)
+    elif _is_stream_workload(workload):
+        ps_copy, ps_scale, ps_add, ps_triad = _run_stream_benchmark(rvm)
+        row["stream_post_copy_mibs"]  = round(ps_copy, 1)
+        row["stream_post_scale_mibs"] = round(ps_scale, 1)
+        row["stream_post_add_mibs"]   = round(ps_add, 1)
+        row["stream_post_triad_mibs"] = round(ps_triad, 1)
+        b_triad = row.get("stream_baseline_triad_mibs", 0)
+        # Overall triad across [baseline, 0 (paused), post].
+        mean_tr, std_tr, _, _ = _compute_overall_stats([b_triad, 0.0, ps_triad])
+        row["overall_triad_mean_mibs"]   = round(mean_tr, 1)
+        row["overall_triad_stddev_mibs"] = round(std_tr, 1)
+
+    rvm.kill()
 
     return row
 
@@ -1142,16 +1364,16 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         "iteration": iteration,
     }
 
-    ops = p50 = p99 = p999 = 0.0
+    ops = avg_us = p50 = p99 = p999 = 0.0
 
     if _is_redis_workload(workload):
         _setup_redis(vm, mem_size_mib)
-        ops, p50, p99, p999 = _measure_redis_baseline(vm, workload)
+        ops, avg_us, p50, p99, p999 = _measure_redis_baseline(vm, workload)
         _start_redis_background_workload(vm, workload)
         _start_redis_during_burst(vm, workload, ops)
     elif _is_memcached_workload(workload):
         _setup_memcached(vm, mem_size_mib)
-        ops, p50, p99, p999 = _measure_memcached_baseline(vm, workload)
+        ops, avg_us, p50, p99, p999 = _measure_memcached_baseline(vm, workload)
         _start_memcached_background_workload(vm, workload)
         _start_memcached_during_burst(vm, workload)
     elif _is_stream_workload(workload):
@@ -1164,6 +1386,7 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
 
     if _is_redis_workload(workload) or _is_memcached_workload(workload):
         row["app_baseline_ops"]     = round(ops, 1)
+        row["app_baseline_avg_us"]  = round(avg_us, 1)
         row["app_baseline_p50_us"]  = round(p50, 1)
         row["app_baseline_p99_us"]  = round(p99, 1)
         row["app_baseline_p999_us"] = round(p999, 1)
@@ -1204,25 +1427,89 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     if _is_redis_workload(workload):
         _wait_for_sentinel(vm, "/tmp/redis_during.done")
         _, log_out, _ = vm.ssh.check_output("cat /tmp/redis_during.log")
-        d_ops, d_p50, d_p99, d_p999 = _parse_redis_benchmark_output(log_out)
+        d_ops, d_avg, d_p50, d_p99, d_p999 = _parse_redis_benchmark_output(log_out)
         row["app_during_ops"]    = round(d_ops, 1)
+        row["app_during_avg_us"] = round(d_avg, 1)
         row["app_during_p50_us"] = round(d_p50, 1)
         row["app_during_p99_us"] = round(d_p99, 1)
         row["app_during_p999_us"] = round(d_p999, 1)
         row["app_ops_degradation_pct"] = (
             round((1 - d_ops / ops) * 100, 1) if ops > 0 else 0
         )
+
+        # Post-snapshot: measure recovery on the still-running source VM.
+        ps_ops, ps_avg, ps_p50, ps_p99, ps_p999 = _measure_post_snapshot_redis(vm, workload)
+        row["post_snap_ops"]     = round(ps_ops, 1)
+        row["post_snap_avg_us"]  = round(ps_avg, 1)
+        row["post_snap_p50_us"]  = round(ps_p50, 1)
+        row["post_snap_p99_us"]  = round(ps_p99, 1)
+        row["post_snap_p999_us"] = round(ps_p999, 1)
+
+        # Overall stats across [baseline, during, post] windows.
+        mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, d_ops, ps_ops])
+        mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, d_avg, ps_avg])
+        mean_p99, std_p99, _, _ = _compute_overall_stats([p99, d_p99, ps_p99])
+        row["overall_ops_mean"]              = round(mean_ops, 1)
+        row["overall_ops_stddev"]            = round(std_ops, 1)
+        row["overall_ops_min"]               = round(min_ops, 1)
+        row["overall_ops_max"]               = round(max_ops, 1)
+        row["overall_avg_latency_us_mean"]   = round(mean_avg, 1)
+        row["overall_avg_latency_us_stddev"] = round(std_avg, 1)
+        row["overall_p99_us_mean"]           = round(mean_p99, 1)
+        row["overall_p99_us_stddev"]         = round(std_p99, 1)
+
     elif _is_memcached_workload(workload):
         _wait_for_sentinel(vm, "/tmp/memtier_during.done")
         _, log_out, _ = vm.ssh.check_output("cat /tmp/memtier_during.log")
-        d_ops, d_p50, d_p99, d_p999 = _parse_memtier_output(log_out)
+        d_ops, d_avg, d_p50, d_p99, d_p999 = _parse_memtier_output(log_out)
         row["app_during_ops"]    = round(d_ops, 1)
+        row["app_during_avg_us"] = round(d_avg, 1)
         row["app_during_p50_us"] = round(d_p50, 1)
         row["app_during_p99_us"] = round(d_p99, 1)
         row["app_during_p999_us"] = round(d_p999, 1)
         row["app_ops_degradation_pct"] = (
             round((1 - d_ops / ops) * 100, 1) if ops > 0 else 0
         )
+
+        # Post-snapshot: measure recovery.
+        ps_ops, ps_avg, ps_p50, ps_p99, ps_p999 = _measure_post_snapshot_memcached(vm, workload)
+        row["post_snap_ops"]     = round(ps_ops, 1)
+        row["post_snap_avg_us"]  = round(ps_avg, 1)
+        row["post_snap_p50_us"]  = round(ps_p50, 1)
+        row["post_snap_p99_us"]  = round(ps_p99, 1)
+        row["post_snap_p999_us"] = round(ps_p999, 1)
+
+        # Also read the long-running background memtier log for overall stats.
+        _, overall_log, _ = vm.ssh.check_output(
+            "cat /tmp/memtier_overall.log 2>/dev/null || true"
+        )
+        ov_ops, ov_avg, _, ov_p99, _ = _parse_memtier_output(overall_log)
+
+        # Use the overall log if it parsed successfully; otherwise fall back to
+        # the mean of the three window measurements.
+        if ov_ops > 0:
+            row["overall_ops_mean"]              = round(ov_ops, 1)
+            row["overall_avg_latency_us_mean"]   = round(ov_avg, 1)
+            row["overall_p99_us_mean"]           = round(ov_p99, 1)
+            # stddev not available from the summary Totals line.
+            row["overall_ops_stddev"]            = 0
+            row["overall_avg_latency_us_stddev"] = 0
+            row["overall_p99_us_stddev"]         = 0
+            row["overall_ops_min"]               = 0
+            row["overall_ops_max"]               = 0
+        else:
+            mean_ops, std_ops, min_ops, max_ops = _compute_overall_stats([ops, d_ops, ps_ops])
+            mean_avg, std_avg, _, _ = _compute_overall_stats([avg_us, d_avg, ps_avg])
+            mean_p99, std_p99, _, _ = _compute_overall_stats([p99, d_p99, ps_p99])
+            row["overall_ops_mean"]              = round(mean_ops, 1)
+            row["overall_ops_stddev"]            = round(std_ops, 1)
+            row["overall_ops_min"]               = round(min_ops, 1)
+            row["overall_ops_max"]               = round(max_ops, 1)
+            row["overall_avg_latency_us_mean"]   = round(mean_avg, 1)
+            row["overall_avg_latency_us_stddev"] = round(std_avg, 1)
+            row["overall_p99_us_mean"]           = round(mean_p99, 1)
+            row["overall_p99_us_stddev"]         = round(std_p99, 1)
+
     elif _is_stream_workload(workload):
         _wait_for_sentinel(vm, "/tmp/stream_during.done")
         _, log_out, _ = vm.ssh.check_output("cat /tmp/stream_during.log")
@@ -1239,6 +1526,23 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         row["stream_triad_degradation_pct"] = (
             round((1 - d_triad / b_triad) * 100, 1) if b_triad > 0 else 0
         )
+
+        # Post-snapshot: run a fresh STREAM benchmark on the still-running VM.
+        ps_copy, ps_scale, ps_add, ps_triad = _run_stream_benchmark(vm)
+        row["stream_post_copy_mibs"]  = round(ps_copy, 1)
+        row["stream_post_scale_mibs"] = round(ps_scale, 1)
+        row["stream_post_add_mibs"]   = round(ps_add, 1)
+        row["stream_post_triad_mibs"] = round(ps_triad, 1)
+
+        # Parse every completed STREAM run from the background log for overall stats.
+        _, stream_all_log, _ = vm.ssh.check_output(
+            "cat /tmp/stream.log 2>/dev/null || true"
+        )
+        all_runs = _parse_stream_log_all_runs(stream_all_log)
+        all_triads = [r["triad"] for r in all_runs if "triad" in r]
+        mean_tr, std_tr, _, _ = _compute_overall_stats(all_triads)
+        row["overall_triad_mean_mibs"]   = round(mean_tr, 1)
+        row["overall_triad_stddev_mibs"] = round(std_tr, 1)
 
     # VM should still be responsive.
     vm.ssh.check_output("true")

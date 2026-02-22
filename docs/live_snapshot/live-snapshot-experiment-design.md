@@ -144,17 +144,28 @@ configuration).
 | Workload write throughput (during live snapshot) | `dd` output | MiB/s |
 | Throughput degradation | Derived: `1 - (during / baseline)` | % |
 
-**Guest-visible performance metrics — application workloads** (measured inside guest):
+**Guest-visible performance metrics — application workloads** (measured inside guest, three windows: baseline / during / post):
 
 | Metric | Source | Unit |
 |--------|--------|------|
-| Ops/sec (baseline) | `redis-benchmark` / `memtier_benchmark` / `memcached` stats | ops/s |
-| Ops/sec (during snapshot) | Same tool, sampled during streaming phase | ops/s |
+| Ops/sec (baseline) | `redis-benchmark` / `memtier_benchmark` | ops/s |
+| Ops/sec (during snapshot) | Same tool, burst overlapping streaming phase | ops/s |
+| Ops/sec (post-snapshot) | Same tool, burst after snapshot completes | ops/s |
 | Ops/sec degradation | Derived: `1 - (during / baseline)` | % |
-| GET latency p50 / p99 / p999 (baseline) | `redis-cli --latency-history` / `memtier` | us |
-| GET latency p50 / p99 / p999 (during snapshot) | Same, sampled during streaming phase | us |
-| SET latency p50 / p99 / p999 (baseline) | Same | us |
-| SET latency p50 / p99 / p999 (during snapshot) | Same | us |
+| Average latency (baseline) | `redis-benchmark` latency summary / `memtier` Avg Lat column | us |
+| Average latency (during / post) | Same | us |
+| p50 / p99 / p999 (baseline) | `redis-benchmark` histogram / `memtier` Totals | us |
+| p50 / p99 / p999 (during / post) | Same | us |
+
+**Overall run metrics** (derived across all three measurement windows):
+
+| Metric | Source | Unit |
+|--------|--------|------|
+| Overall ops/sec mean / stddev / min / max | Derived from [baseline, during, post] | ops/s |
+| Overall average latency mean / stddev | Derived from [baseline, during, post] avg latency | us |
+| Overall p99 mean / stddev | Derived from [baseline, during, post] p99 | us |
+| Overall throughput mean / stddev | Derived from [baseline, during, post] MiB/s (synthetic) | MiB/s |
+| Overall Triad bandwidth mean / stddev | Derived from all completed STREAM runs in log | MiB/s |
 
 **Guest-visible performance metrics — STREAM benchmark** (measured inside guest):
 
@@ -602,17 +613,36 @@ and application workloads are noted inline.
    - SSH connectivity check
    - Sample during-snapshot performance:
      Synthetic: run a timed dd burst, record throughput
-     Redis: run a 50,000-op burst, record ops/sec; parse latency log
-            for the window overlapping Phase 3
+     Redis: run a 50,000-op burst, record ops/sec and avg/p50/p99/p999
      Memcached: parse memtier output for the snapshot-overlapping window
      STREAM: parse stream.log for the run overlapping Phase 3
+
+7b. POST-SNAPSHOT MEASUREMENT (Live: on source VM; Full: on restored VM)
+   - Run a third performance burst after the snapshot has fully completed,
+     measuring the same metrics as the baseline (ops/sec, avg latency,
+     p50/p99/p999 for Redis/Memcached; Copy/Scale/Add/Triad for STREAM;
+     throughput MiB/s for synthetic dd).
+   - This "recovery" measurement shows whether performance returns to
+     baseline after the snapshot overhead has passed.
+   - For STREAM: also read the full background stream.log and parse all
+     completed run results to compute Triad mean/stddev across the entire
+     test lifetime.
+   - For Memcached: read /tmp/memtier_overall.log (the 600-second background
+     run) for the Totals line, which covers the full pre/during/post window.
 
 8. RESTORE SNAPSHOT
    - Build new VM, restore from snapshot
    - Measure restore API latency and time-to-SSH-ready
    - Verify restored VM is functional (SSH check)
+   - For Full snapshot: run post-snapshot measurements on the restored VM
 
 9. COLLECT AND STORE RESULTS
+   - Compute overall run statistics from [baseline, during, post] windows:
+       overall_ops_mean/stddev/min/max
+       overall_avg_latency_us_mean/stddev
+       overall_p99_us_mean/stddev
+       overall_throughput_mean/stddev_mibs
+       overall_triad_mean/stddev_mibs (STREAM only)
    - Parse all metrics into structured record
    - Append to results CSV/JSON
    - Kill source and restored VMs
@@ -668,16 +698,30 @@ rss_pre_kib, rss_peak_kib, mem_file_bytes,
 # Guest workload — synthetic (dd)
 workload_baseline_mibs, workload_during_mibs, workload_degradation_pct,
 actual_write_rate_mibs,
-# Guest workload — application (Redis / Memcached)
-app_baseline_ops, app_during_ops, app_ops_degradation_pct,
+# Guest workload — application (Redis / Memcached) — per-window
+app_baseline_ops, app_baseline_avg_us,
 app_baseline_p50_us, app_baseline_p99_us, app_baseline_p999_us,
+app_during_ops, app_during_avg_us,
 app_during_p50_us, app_during_p99_us, app_during_p999_us,
-# Guest workload — STREAM
+app_ops_degradation_pct,
+# Post-snapshot measurements
+post_snap_ops, post_snap_avg_us,
+post_snap_p50_us, post_snap_p99_us, post_snap_p999_us,
+post_snap_throughput_mibs,
+# Overall run aggregates (across pre/during/post windows)
+overall_ops_mean, overall_ops_stddev, overall_ops_min, overall_ops_max,
+overall_avg_latency_us_mean, overall_avg_latency_us_stddev,
+overall_p99_us_mean, overall_p99_us_stddev,
+overall_throughput_mean_mibs, overall_throughput_stddev_mibs,
+overall_triad_mean_mibs, overall_triad_stddev_mibs,
+# Guest workload — STREAM — per-window
 stream_baseline_copy_mibs, stream_baseline_scale_mibs,
 stream_baseline_add_mibs, stream_baseline_triad_mibs,
 stream_during_copy_mibs, stream_during_scale_mibs,
 stream_during_add_mibs, stream_during_triad_mibs,
-stream_triad_degradation_pct
+stream_triad_degradation_pct,
+stream_post_copy_mibs, stream_post_scale_mibs,
+stream_post_add_mibs, stream_post_triad_mibs
 ```
 
 Fields are populated based on workload type; unused fields are left empty.
