@@ -847,6 +847,154 @@ def plot_service_interruption(grouped, outdir):
 
 
 # ---------------------------------------------------------------------------
+# Plot 16: Throughput-over-time timeline (reconstructed schematic)
+# ---------------------------------------------------------------------------
+
+
+def plot_throughput_timeline(grouped, outdir):
+    """Reconstructed schematic timeline of ops/sec through a snapshot cycle.
+
+    Uses redis_light workload for both 512 MiB and 2048 MiB.  The x-axis is
+    derived from per-window averages (baseline duration = 50000 ops / ops_per_s,
+    snapshot duration = total_us or full_total_ms, post duration = 50000 /
+    post_ops).  The resulting figure is explicitly schematic — not raw samples.
+    """
+    wl = "redis_light"
+    mems_to_plot = [m for m in APP_MEM_SIZES if any(
+        grouped.get((m, wl, mode), []) for mode in ["full", "live"]
+    )]
+    if not mems_to_plot:
+        print("  Skipping plot 16: no redis_light data in CSV")
+        return
+
+    mem_colors = {512: "#90CAF9", 2048: "#1565C0"}
+    fig, (ax_full, ax_live) = plt.subplots(1, 2, figsize=(16, 6))
+
+    for mem in mems_to_plot:
+        color = mem_colors.get(mem, "#2196F3")
+
+        # ------------------------------------------------------------------ #
+        # Full snapshot panel
+        # ------------------------------------------------------------------ #
+        full_rows = grouped.get((mem, wl, "full"), [])
+        if full_rows:
+            b_ops   = avg([r.get("app_baseline_ops", 0) for r in full_rows])
+            p_ops   = avg([r.get("post_snap_ops",    0) for r in full_rows])
+            snap_ms = avg([r.get("full_total_ms",    0) for r in full_rows])
+
+            if b_ops > 0 and p_ops > 0 and snap_ms > 0:
+                t_base  = 50000.0 / b_ops         # s
+                snap_s  = snap_ms / 1000.0         # s
+                t_post  = 50000.0 / p_ops          # s
+
+                segments = [
+                    (0,                       t_base,              b_ops,  "baseline"),
+                    (t_base,                  t_base + snap_s,     0,      "paused"),
+                    (t_base + snap_s,         t_base + snap_s + t_post, p_ops, "post-snap"),
+                ]
+
+                # Build step-function arrays
+                xs, ys = [], []
+                for t0, t1, ops, _ in segments:
+                    xs += [t0, t1]
+                    ys += [ops, ops]
+
+                ax_full.plot(xs, ys, color=color, linewidth=2,
+                             label=f"{mem} MiB")
+
+                # Vertical lines at snapshot start / end
+                ax_full.axvline(t_base,         color=color, linestyle="--",
+                                linewidth=1, alpha=0.6)
+                ax_full.axvline(t_base + snap_s, color=color, linestyle="--",
+                                linewidth=1, alpha=0.6)
+
+                # Red hatch for unresponsive window
+                ax_full.axvspan(t_base, t_base + snap_s,
+                                alpha=0.15, color="red", hatch="//",
+                                label="_nolegend_")
+
+        # ------------------------------------------------------------------ #
+        # Live snapshot panel
+        # ------------------------------------------------------------------ #
+        live_rows = grouped.get((mem, wl, "live"), [])
+        if live_rows:
+            b_ops    = avg([r.get("app_baseline_ops", 0) for r in live_rows])
+            d_ops    = avg([r.get("app_during_ops",   0) for r in live_rows])
+            p_ops    = avg([r.get("post_snap_ops",    0) for r in live_rows])
+            snap_us  = avg([r.get("total_us",         0) for r in live_rows])
+            ph1_us   = avg([r.get("phase1_us",        0) for r in live_rows])
+            down_us  = avg([r.get("downtime_us",      0) for r in live_rows])
+
+            if b_ops > 0 and p_ops > 0 and snap_us > 0:
+                t_base   = 50000.0 / b_ops
+                snap_s   = snap_us  / 1e6
+                ph1_s    = ph1_us   / 1e6
+                freeze_s = down_us  / 1e6
+                t_post   = 50000.0 / p_ops
+
+                segments = [
+                    (0,
+                     t_base,
+                     b_ops,
+                     "baseline"),
+                    (t_base,
+                     t_base + ph1_s,
+                     d_ops,
+                     "during (pre-freeze)"),
+                    (t_base + ph1_s,
+                     t_base + ph1_s + freeze_s,
+                     0,
+                     "frozen (downtime)"),
+                    (t_base + ph1_s + freeze_s,
+                     t_base + snap_s,
+                     d_ops,
+                     "during (post-freeze)"),
+                    (t_base + snap_s,
+                     t_base + snap_s + t_post,
+                     p_ops,
+                     "post-snap"),
+                ]
+
+                xs, ys = [], []
+                for t0, t1, ops, _ in segments:
+                    xs += [t0, t1]
+                    ys += [ops, ops]
+
+                ax_live.plot(xs, ys, color=color, linewidth=2,
+                             label=f"{mem} MiB")
+
+                ax_live.axvline(t_base,          color=color, linestyle="--",
+                                linewidth=1, alpha=0.6)
+                ax_live.axvline(t_base + snap_s, color=color, linestyle="--",
+                                linewidth=1, alpha=0.6)
+
+                # Red hatch only for the brief freeze window
+                ax_live.axvspan(t_base + ph1_s,
+                                t_base + ph1_s + freeze_s,
+                                alpha=0.15, color="red", hatch="//",
+                                label="_nolegend_")
+
+    for ax, title in [
+        (ax_full, "Full Snapshot (VM fully paused)"),
+        (ax_live, "Live Snapshot (brief freeze only)"),
+    ]:
+        ax.set_xlabel("Time (s)", fontsize=12)
+        ax.set_ylabel("Throughput (ops/s)", fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(bottom=0)
+
+    fig.suptitle(
+        "Redis Light: Throughput Timeline Through Snapshot\n"
+        "Reconstructed from per-window averages (x-axis is approximate)",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout()
+    _savefig(fig, outdir, "16_throughput_timeline.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -880,9 +1028,10 @@ def main():
     plot_overall_avg_latency(grouped, outdir)
     plot_three_window_throughput(grouped, outdir)
     plot_service_interruption(grouped, outdir)
+    plot_throughput_timeline(grouped, outdir)
 
     print()
-    print(f"Done! {15} plots saved to {outdir}/")
+    print(f"Done! {16} plots saved to {outdir}/")
 
 
 if __name__ == "__main__":
