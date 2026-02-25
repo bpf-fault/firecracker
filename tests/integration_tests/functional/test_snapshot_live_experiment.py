@@ -17,6 +17,7 @@ import math
 import os
 import re
 import statistics
+import threading
 import time
 from pathlib import Path
 
@@ -75,6 +76,8 @@ RESULTS_FILE = os.environ.get(
         "experiment_results.csv",
     ),
 )
+
+TIMESERIES_DIR = os.path.join(os.path.dirname(RESULTS_FILE), "timeseries")
 
 CSV_FIELDS = [
     "timestamp",
@@ -144,6 +147,12 @@ CSV_FIELDS = [
     "stream_triad_degradation_pct",
     "stream_post_copy_mibs", "stream_post_scale_mibs",
     "stream_post_add_mibs",  "stream_post_triad_mibs",
+    # Timeseries (throughput timeline — live snapshot only)
+    "timeseries_file",
+    "ts_snap_start_s",
+    "ts_snap_end_s",
+    "ts_freeze_start_s",
+    "ts_freeze_end_s",
 ]
 
 
@@ -393,6 +402,66 @@ def _stop_workload(vm):
     """Kill any background dd/sh workload processes in the guest."""
     vm.ssh.check_output("pkill -f 'dd if=/dev/urandom' 2>/dev/null || true")
     vm.ssh.check_output("pkill -f 'of=/tmp/workload' 2>/dev/null || true")
+
+
+# ---------------------------------------------------------------------------
+# Timeseries sampling (throughput timeline for plot 16)
+# ---------------------------------------------------------------------------
+
+
+def _start_timeseries_sampler(vm, workload):
+    """Start a daemon thread that samples redis throughput every ~100 ms.
+
+    Returns a handle dict for use with _stop_timeseries_sampler / _write_timeseries_csv.
+    Only call for redis workloads.
+    """
+    params = REDIS_WORKLOAD_PARAMS[workload]
+    clients = params["clients"]
+    ops_arg = params["ops"]
+    samples = []          # [(t_rel_s, ops_per_sec, p99_ms)]
+    stop_event = threading.Event()
+    start_wall = time.monotonic()
+
+    def _loop():
+        while not stop_event.is_set():
+            t_start = time.monotonic()
+            t_rel = t_start - start_wall
+            try:
+                _, out, _ = vm.ssh.check_output(
+                    f"redis-benchmark -t {ops_arg} -q -n 500 -c {clients}",
+                    timeout=2,
+                )
+                # -q output: "GET: 37037.04 requests per second"
+                m = re.search(r"([\d.]+) requests per second", out)
+                if m:
+                    samples.append((round(t_rel, 3), float(m.group(1)), 0.0))
+            except Exception:
+                pass  # expected during VM freeze or if SSH channel times out
+            elapsed = time.monotonic() - t_start
+            stop_event.wait(max(0.0, 0.1 - elapsed))
+
+    t = threading.Thread(target=_loop, daemon=True, name="ts_sampler")
+    t.start()
+    return {"thread": t, "stop": stop_event, "samples": samples, "start_wall": start_wall}
+
+
+def _stop_timeseries_sampler(handle):
+    """Signal the sampler thread to stop and wait for it to finish."""
+    handle["stop"].set()
+    handle["thread"].join(timeout=5)
+
+
+def _write_timeseries_csv(handle, workload, mem_size_mib, mode, iteration):
+    """Write collected samples to a timeseries CSV. Returns the relative path string."""
+    os.makedirs(TIMESERIES_DIR, exist_ok=True)
+    name = f"{workload}_{mem_size_mib}mib_{mode}_iter{iteration:02d}.csv"
+    path = os.path.join(TIMESERIES_DIR, name)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_ms", "t_rel_s", "throughput", "p99_ms"])
+        for t_rel, ops, p99 in handle["samples"]:
+            w.writerow([round(t_rel * 1000, 1), t_rel, round(ops, 1), round(p99, 3)])
+    return f"timeseries/{name}"
 
 
 # ---------------------------------------------------------------------------
@@ -1409,10 +1478,24 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     pid = vm.firecracker_pid
     row["rss_pre_kib"] = _get_rss_kib(pid)
 
+    # Start timeseries sampler for redis workloads (used by plot 16).
+    # We sleep briefly before and after the snapshot so the sampler captures
+    # pre-snapshot baseline samples and post-snapshot streaming-phase samples.
+    # The sampler is stopped BEFORE _wait_for_sentinel, which holds a blocking
+    # SSH call and would starve the sampler thread.
+    ts_handle = None
+    if _is_redis_workload(workload):
+        ts_handle = _start_timeseries_sampler(vm, workload)
+        time.sleep(5)   # collect ~30 pre-snapshot baseline samples
+
+    ts_snap_start_rel = (time.monotonic() - ts_handle["start_wall"]) if ts_handle else 0.0
+
     # Take live snapshot — VM keeps running.
     assert vm.state == "Running"
     snapshot = vm.snapshot_live()
     assert vm.state == "Running"
+
+    ts_snap_end_rel = (time.monotonic() - ts_handle["start_wall"]) if ts_handle else 0.0
 
     row["rss_peak_kib"] = _get_peak_rss_kib(pid)
 
@@ -1423,6 +1506,22 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     live_metrics = _parse_live_snapshot_log(vm.log_data)
     row.update(live_metrics)
     row["service_interruption_ms"] = round(live_metrics.get("downtime_us", 0) / 1000, 2)
+
+    if ts_handle:
+        row["ts_snap_start_s"] = round(ts_snap_start_rel, 3)
+        row["ts_snap_end_s"] = round(ts_snap_end_rel, 3)
+        phase1_s = live_metrics.get("phase1_us", 0) / 1e6
+        freeze_s = live_metrics.get("freeze_us", 0) / 1e6
+        row["ts_freeze_start_s"] = round(row["ts_snap_start_s"] + phase1_s, 3)
+        row["ts_freeze_end_s"]   = round(row["ts_snap_start_s"] + phase1_s + freeze_s, 3)
+        # Collect ~60 post-snapshot samples during UFFD streaming, then stop
+        # before _wait_for_sentinel blocks the SSH channel.
+        try:
+            time.sleep(10)
+        finally:
+            _stop_timeseries_sampler(ts_handle)
+        ts_name = _write_timeseries_csv(ts_handle, workload, mem_size_mib, "live", iteration)
+        row["timeseries_file"] = ts_name
 
     total_pages = live_metrics.get("total_pages", 0)
     fault_pages = live_metrics.get("fault_pages", 0)
