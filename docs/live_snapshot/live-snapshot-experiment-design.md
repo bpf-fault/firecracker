@@ -721,10 +721,21 @@ stream_during_copy_mibs, stream_during_scale_mibs,
 stream_during_add_mibs, stream_during_triad_mibs,
 stream_triad_degradation_pct,
 stream_post_copy_mibs, stream_post_scale_mibs,
-stream_post_add_mibs, stream_post_triad_mibs
+stream_post_add_mibs, stream_post_triad_mibs,
+# Per-run continuous timeseries
+timeseries_file,         # relative path to timeseries CSV (empty if sampler not supported)
+ts_snap_start_s,         # snapshot start, seconds from sampler t=0
+ts_snap_end_s,           # snapshot end, seconds from sampler t=0
+ts_freeze_start_s,       # freeze window start (= snap_start for full snapshot)
+ts_freeze_end_s,         # freeze window end   (= snap_end   for full snapshot)
 ```
 
 Fields are populated based on workload type; unused fields are left empty.
+
+In addition to the main CSV, each Redis and Memcached run writes a
+per-run timeseries file to
+`test_results/timeseries/<workload>_<mem>mib_<mode>_iter<NN>.csv`
+with columns `t_ms, t_rel_s, throughput, p99_ms` sampled at ~100 ms intervals.
 The `extrasaction="ignore"` option in the CSV writer silently skips any
 extra keys not in the field list.
 
@@ -817,6 +828,34 @@ For each (memory_size, workload) pair, compute across 10 iterations:
     - Grouped by memory size
     - Compares scattered (Redis/Memcached) vs sequential (dd) vs
       full-sweep (STREAM) fault patterns
+
+12. **Fault Fraction Comparison** (bar chart)
+    - Same data as plot 11 but rendered separately for clarity
+
+13. **Overall Average Latency with Error Bars** (grouped bar chart)
+    - X: workload type, Y: overall average latency (µs)
+    - Bars: full vs live, with stddev error bars
+    - Reveals whether live snapshot raises mean latency across the full run
+
+14. **Three-Window Throughput Recovery** (grouped bar chart, synthetic only)
+    - X: workload, Y: ops/s or MiB/s across pre / during / post windows
+    - Shows whether throughput fully recovers after the snapshot completes
+
+15. **Service Interruption** (grouped bar chart)
+    - X: workload type, Y: service-interruption duration (ms)
+    - Bars: full vs live
+    - Quantifies the observable pause seen by clients
+
+16. **Throughput-over-Time Timeline** (scatter / step-function, two panels)
+    - X: time (s), Y: ops/sec; left panel = full snapshot, right = live
+    - Uses `redis_light` workload for 512 MiB and 2048 MiB configurations
+    - **When per-run timeseries CSVs are present** (collected during the
+      experiment at ~100 ms intervals), each panel is rendered as a scatter
+      plot with vertical dashed lines marking `ts_snap_start_s` /
+      `ts_snap_end_s` and a red-hatched region for the freeze window.
+    - **Falls back** to a reconstructed step-function derived from the
+      per-window averages (`app_baseline_ops`, `app_during_ops`,
+      `post_snap_ops`) when no timeseries files are available.
 
 ### 9.3 Statistical Tests
 
@@ -982,6 +1021,14 @@ sudo -E ./tools/devtool -y test -- \
 **Targeted runs:**
 
 ```bash
+# Redis workloads only (all mem sizes, all iterations) — ~3 hours
+export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
+sudo -E ./tools/devtool -y test -- \
+    integration_tests/functional/test_snapshot_live_experiment.py \
+    -k "app_experiment and redis" \
+    -s --log-cli-level=INFO -m "" --timeout=900 \
+    2>&1 | tee test_results/redis_experiment.log
+
 # Redis workloads only, 512 MiB VM
 export EXPERIMENT_ROOTFS=/firecracker/test_results/app-rootfs.ext4
 sudo -E ./tools/devtool -y test -- \
@@ -1060,6 +1107,36 @@ python3 tests/integration_tests/functional/analyze_experiment_results.py \
     test_results/experiment_results.csv
 
 # Generate plots (requires matplotlib, produces PNGs in test_results/)
+python3 tests/integration_tests/functional/plot_experiment_results.py \
+    test_results/experiment_results.csv
+```
+
+### 11.6 Timeseries Verification
+
+After a Redis or Memcached experiment run, confirm the per-run timeseries
+files were created and inspect their contents:
+
+```bash
+# Confirm per-run timeseries files were created
+ls -lh test_results/timeseries/redis_light_512mib_live_iter00.csv
+
+# Inspect columns and sample count
+head -3 test_results/timeseries/redis_light_512mib_live_iter00.csv
+wc -l   test_results/timeseries/redis_light_512mib_live_iter00.csv
+# Expect: 30–200 rows (header + data) depending on experiment duration
+
+# Check timing anchors in main CSV
+python3 -c "
+import csv
+for r in csv.DictReader(open('test_results/experiment_results.csv')):
+    if r['workload']=='redis_light' and r['snapshot_mode']=='live':
+        print('snap:', r['ts_snap_start_s'], '->', r['ts_snap_end_s'],
+              '| freeze:', r['ts_freeze_start_s'], '->', r['ts_freeze_end_s'],
+              '| file:', r['timeseries_file'])
+        break
+"
+
+# Regenerate plot 16 (shows scatter instead of step-function when timeseries present)
 python3 tests/integration_tests/functional/plot_experiment_results.py \
     test_results/experiment_results.csv
 ```
