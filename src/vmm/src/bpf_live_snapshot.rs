@@ -973,6 +973,16 @@ pub fn create_live_bpf_snapshot(
                     Ok(())
                 })
                 .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
+
+            // Check for ring buffer overflow between batches so we fail
+            // early instead of completing a corrupted snapshot.
+            let drops = read_bpf_drop_counter(&bpf_obj);
+            if drops > 0 {
+                return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
+                    "ring buffer dropped {drops} pre-image(s) during linear scan \
+                     (batch {batch_start}/{total_pages}) — snapshot is inconsistent",
+                )));
+            }
         }
     }
 
@@ -1018,15 +1028,14 @@ pub fn create_live_bpf_snapshot(
 
     // Check BPF drop counter: ring buffer overflows mean some pre-images
     // were lost and those pages were saved with post-write content by the
-    // linear scan.  This degrades point-in-time consistency.
+    // linear scan.  The snapshot is inconsistent and must not be used.
     let drop_count = read_bpf_drop_counter(&bpf_obj);
     if drop_count > 0 {
-        warn!(
-            "Live-BPF snapshot: ring buffer dropped {} pre-image(s) — \
-             snapshot consistency may be degraded. Consider increasing \
-             ring buffer size.",
-            drop_count
-        );
+        return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
+            "ring buffer dropped {drop_count} pre-image(s) during snapshot — \
+             snapshot is inconsistent. Consider increasing ring buffer size \
+             or reducing LINEAR_BATCH.",
+        )));
     }
 
     info!(

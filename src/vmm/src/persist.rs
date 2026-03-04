@@ -165,6 +165,8 @@ pub enum CreateSnapshotError {
     BpfWriteProtect(String),
     /// Failed ring buffer operation during bpf_fault live snapshot: {0}
     BpfRingBuf(String),
+    /// Ring buffer overflow during bpf_fault live snapshot — pre-images lost: {0}
+    BpfRingBufOverflow(String),
 }
 
 /// Snapshot version
