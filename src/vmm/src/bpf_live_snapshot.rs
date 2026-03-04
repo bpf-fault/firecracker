@@ -957,18 +957,21 @@ pub fn create_live_bpf_snapshot(
             batch_start = batch_end;
 
             // Drain ring buffer between batches to prevent overflow.
+            // Always write the pre-image — it is the correct point-in-time
+            // content even if the linear scan already saved post-write data
+            // for this page.
             ring_consumer
                 .for_each(|addr, data| {
                     if let Some(idx) =
                         addr_to_page_index(&slot_ranges, addr as usize, page_size)
                     {
+                        let pg = &pages[idx];
+                        mem_file.write_all_at(data, pg.file_offset)?;
                         if !bitmap_test(&saved_bitmap, idx) {
-                            let pg = &pages[idx];
-                            mem_file.write_all_at(data, pg.file_offset)?;
                             bitmap_set(&mut saved_bitmap, idx);
                             saved_count += 1;
-                            ringbuf_pages_saved += 1;
                         }
+                        ringbuf_pages_saved += 1;
                     }
                     Ok(())
                 })
@@ -994,13 +997,13 @@ pub fn create_live_bpf_snapshot(
         ring_consumer
             .for_each(|addr, data| {
                 if let Some(idx) = addr_to_page_index(&slot_ranges, addr as usize, page_size) {
+                    let page = &pages[idx];
+                    mem_file.write_all_at(data, page.file_offset)?;
                     if !bitmap_test(&saved_bitmap, idx) {
-                        let page = &pages[idx];
-                        mem_file.write_all_at(data, page.file_offset)?;
                         bitmap_set(&mut saved_bitmap, idx);
                         saved_count += 1;
-                        ringbuf_pages_saved += 1;
                     }
+                    ringbuf_pages_saved += 1;
                 }
                 Ok(())
             })
