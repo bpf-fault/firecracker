@@ -54,6 +54,7 @@ class SnapshotType(Enum):
     DIFF = auto()
     DIFF_MINCORE = auto()
     LIVE = auto()
+    LIVE_BPF = auto()
 
     def __repr__(self):
         cls_name = self.__class__.__name__
@@ -79,6 +80,8 @@ class SnapshotType(Enum):
                 return "Diff"
             case SnapshotType.LIVE:
                 return "Live"
+            case SnapshotType.LIVE_BPF:
+                return "LiveBpf"
 
 
 def hardlink_or_copy(src, dst):
@@ -1089,6 +1092,38 @@ class Microvm:
             net_ifaces=[x["iface"] for ifname, x in self.iface.items()],
             ssh_key=self.ssh_key,
             snapshot_type=SnapshotType.LIVE,
+            meta={
+                "kernel_file": str(self.kernel_file),
+                "vcpus_count": self.vcpus_count,
+            },
+        )
+
+    def snapshot_live_bpf(self, *, mem_path: str = "mem", vmstate_path="vmstate"):
+        """Make a LiveBpf snapshot (VM is not paused, vCPUs never blocked)"""
+        # Copy kernel BTF into the jailer chroot at the standard sysfs path
+        # so that libbpf can find it during BPF object loading.
+        btf_dir = Path(self.chroot()) / "sys" / "kernel" / "btf"
+        btf_dir.mkdir(parents=True, exist_ok=True)
+        btf_dst = btf_dir / "vmlinux"
+        if not btf_dst.exists():
+            import shutil
+
+            shutil.copyfile("/sys/kernel/btf/vmlinux", btf_dst)
+            os.chown(btf_dst, self.jailer.uid, self.jailer.gid)
+
+        self.api.snapshot_create.put(
+            mem_file_path=str(mem_path),
+            snapshot_path=str(vmstate_path),
+            snapshot_type="LiveBpf",
+        )
+        root = Path(self.chroot())
+        return Snapshot(
+            vmstate=root / vmstate_path,
+            mem=root / mem_path,
+            disks=self.disks,
+            net_ifaces=[x["iface"] for ifname, x in self.iface.items()],
+            ssh_key=self.ssh_key,
+            snapshot_type=SnapshotType.LIVE_BPF,
             meta={
                 "kernel_file": str(self.kernel_file),
                 "vcpus_count": self.vcpus_count,

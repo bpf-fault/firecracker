@@ -340,6 +340,7 @@ run_devctr() {
     # content and allow sharing between containers.
     docker run "${docker_args[@]}" \
         --rm \
+        --network host \
         --volume /dev:/dev \
         --volume "$FC_ROOT_DIR:$CTR_FC_ROOT_DIR:z" \
         --volume "$FC_ROOT_DIR/build/cargo_registry:/usr/local/rust/registry:z" \

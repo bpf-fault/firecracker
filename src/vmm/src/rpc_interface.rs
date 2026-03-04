@@ -8,6 +8,7 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
+use super::bpf_live_snapshot::create_live_bpf_snapshot;
 use super::persist::{create_live_snapshot, create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
@@ -876,6 +877,22 @@ impl RuntimeApiController {
                     elapsed_time_us
                 );
             }
+            SnapshotType::LiveBpf => {
+                if locked_vmm.instance_info.state != VmState::Running {
+                    return Err(VmmActionError::CreateSnapshot(
+                        CreateSnapshotError::VmmError(VmmError::VcpuPause),
+                    ));
+                }
+                create_live_bpf_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+                let elapsed_time_us = update_metric_with_elapsed_time(
+                    &METRICS.latencies_us.vmm_live_bpf_create_snapshot,
+                    create_start_us,
+                );
+                info!(
+                    "'create live-bpf snapshot' VMM action took {} us.",
+                    elapsed_time_us
+                );
+            }
             _ => {
                 create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
                 match create_params.snapshot_type {
@@ -899,7 +916,7 @@ impl RuntimeApiController {
                             elapsed_time_us
                         );
                     }
-                    SnapshotType::Live => unreachable!(),
+                    SnapshotType::Live | SnapshotType::LiveBpf => unreachable!(),
                 }
             }
         }
