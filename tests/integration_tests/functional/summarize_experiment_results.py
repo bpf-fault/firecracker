@@ -9,106 +9,13 @@ Usage:
 Writes test_results/experiment_summary.md (alongside the CSV).
 """
 
-import csv
 import os
 import sys
-from collections import defaultdict
-
-# ---------------------------------------------------------------------------
-# Constants (mirror analyze_experiment_results.py)
-# ---------------------------------------------------------------------------
-
-MEM_SIZES = [256, 512, 1024, 2048, 4096]
-WORKLOADS = ["idle", "light", "medium", "heavy"]
-APP_MEM_SIZES = [512, 2048]
-APP_WORKLOADS = [
-    "redis_light", "redis_mixed", "redis_heavy",
-    "memcached_light", "memcached_heavy",
-]
-STREAM_KERNELS = ["copy", "scale", "add", "triad"]
-
-
-def _repo_root():
-    return os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-
-
-DEFAULT_CSV = os.path.join(_repo_root(), "test_results", "experiment_results.csv")
-
-# ---------------------------------------------------------------------------
-# Helpers (copied from analyze_experiment_results.py — no import)
-# ---------------------------------------------------------------------------
-
-
-def load_csv(path):
-    """Load CSV rows as dicts."""
-    rows = []
-    with open(path, newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append(r)
-    return rows
-
-
-def group_rows(rows):
-    """Group rows by (mem_size_mib, workload, snapshot_mode)."""
-    grouped = defaultdict(list)
-    for r in rows:
-        key = (int(r["mem_size_mib"]), r["workload"], r["snapshot_mode"])
-        grouped[key].append(r)
-    return grouped
-
-
-def avg(vals):
-    """Mean of a list of numbers; empty/blank values are ignored."""
-    vals = [float(v) for v in vals if v]
-    return sum(vals) / len(vals) if vals else 0.0
-
-
-def stdev(vals):
-    """Sample standard deviation; returns 0 for < 2 values."""
-    vals = [float(v) for v in vals if v]
-    if len(vals) < 2:
-        return 0.0
-    m = sum(vals) / len(vals)
-    return (sum((x - m) ** 2 for x in vals) / (len(vals) - 1)) ** 0.5
-
-
-# ---------------------------------------------------------------------------
-# Computation helpers
-# ---------------------------------------------------------------------------
-
-
-def linear_regression(xs, ys):
-    """Least-squares linear fit; returns (slope, intercept, r_squared)."""
-    n = len(xs)
-    if n < 2:
-        return 0.0, 0.0, 0.0
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    ss_xy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    ss_xx = sum((x - mx) ** 2 for x in xs)
-    if ss_xx == 0:
-        return 0.0, my, 0.0
-    slope = ss_xy / ss_xx
-    intercept = my - slope * mx
-    y_pred = [slope * x + intercept for x in xs]
-    ss_res = sum((y - yp) ** 2 for y, yp in zip(ys, y_pred))
-    ss_tot = sum((y - my) ** 2 for y in ys)
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
-    return slope, intercept, r2
-
-
-def cv_pct(vals):
-    """Coefficient of variation as a percentage."""
-    vals = [float(v) for v in vals if v]
-    if not vals:
-        return 0.0
-    m = sum(vals) / len(vals)
-    if m == 0:
-        return 0.0
-    sd = stdev([str(v) for v in vals])
-    return sd / m * 100.0
+from analysis.io import (
+    DEFAULT_CSV, MEM_SIZES, WORKLOADS, APP_MEM_SIZES, APP_WORKLOADS,
+    STREAM_KERNELS, load_csv, group_rows,
+)
+from analysis.stats import avg, stdev, linear_regression, cv_pct
 
 
 # ---------------------------------------------------------------------------

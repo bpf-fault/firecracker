@@ -10,59 +10,13 @@ If no path is given, defaults to test_results/experiment_results.csv
 relative to the repo root.
 """
 
-import csv
 import os
 import sys
-from collections import defaultdict
-
-
-def _repo_root():
-    return os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-
-
-DEFAULT_CSV = os.path.join(_repo_root(), "test_results", "experiment_results.csv")
-
-MEM_SIZES = [256, 512, 1024, 2048, 4096]
-WORKLOADS = ["idle", "light", "medium", "heavy"]
-APP_MEM_SIZES = [512, 2048]
-APP_WORKLOADS = [
-    "redis_light", "redis_mixed", "redis_heavy",
-    "memcached_light", "memcached_heavy",
-]
-STREAM_KERNELS = ["copy", "scale", "add", "triad"]
-
-
-def load_csv(path):
-    rows = []
-    with open(path, newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append(r)
-    return rows
-
-
-def group_rows(rows):
-    """Group rows by (mem_size_mib, workload, snapshot_mode), averaging across
-    PCI modes and iterations."""
-    grouped = defaultdict(list)
-    for r in rows:
-        key = (int(r["mem_size_mib"]), r["workload"], r["snapshot_mode"])
-        grouped[key].append(r)
-    return grouped
-
-
-def avg(vals):
-    vals = [float(v) for v in vals if v]
-    return sum(vals) / len(vals) if vals else 0
-
-
-def stdev(vals):
-    vals = [float(v) for v in vals if v]
-    if len(vals) < 2:
-        return 0
-    m = sum(vals) / len(vals)
-    return (sum((x - m) ** 2 for x in vals) / (len(vals) - 1)) ** 0.5
+from analysis.io import (
+    DEFAULT_CSV, MEM_SIZES, WORKLOADS, APP_MEM_SIZES, APP_WORKLOADS,
+    STREAM_KERNELS, load_csv, group_rows,
+)
+from analysis.stats import avg, stdev
 
 
 # ---------------------------------------------------------------------------
