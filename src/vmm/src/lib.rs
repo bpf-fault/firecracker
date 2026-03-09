@@ -92,6 +92,13 @@ pub mod logger;
 pub mod mmds;
 /// PCI specific emulation code.
 pub mod pci;
+/// bpf_fault-based live snapshot implementation.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub mod bpf_live_snapshot;
 /// Save/restore utilities.
 pub mod persist;
 /// Resource store for configured microVM resources.

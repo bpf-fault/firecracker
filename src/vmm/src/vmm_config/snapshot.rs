@@ -20,6 +20,8 @@ pub enum SnapshotType {
     Full,
     /// Live snapshot (VM continues running during memory dump).
     Live,
+    /// Live snapshot using bpf_fault (VM continues running, vCPUs never blocked).
+    LiveBpf,
 }
 
 /// Specifies the method through which guest memory will get populated when

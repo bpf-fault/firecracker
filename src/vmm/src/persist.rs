@@ -157,6 +157,16 @@ pub enum CreateSnapshotError {
     UffdReadEvent(userfaultfd::Error),
     /// VMM error during live snapshot: {0}
     VmmError(VmmError),
+    /// Failed to load BPF object for bpf_fault live snapshot: {0}
+    BpfLoad(String),
+    /// Failed to attach bpf_fault to memory region: {0}
+    BpfAttach(String),
+    /// Failed to enable/resolve write-protection via bpf_fault: {0}
+    BpfWriteProtect(String),
+    /// Failed ring buffer operation during bpf_fault live snapshot: {0}
+    BpfRingBuf(String),
+    /// Ring buffer overflow during bpf_fault live snapshot — pre-images lost: {0}
+    BpfRingBufOverflow(String),
 }
 
 /// Snapshot version
@@ -321,6 +331,21 @@ pub fn create_live_snapshot(
         .set_len(total_mem_size)
         .map_err(|err| CreateSnapshotError::MemoryBackingFile("set_len", err))?;
 
+    // Pre-allocate the snapshot file's backing pages.  On tmpfs, pwrite()
+    // would otherwise allocate + zero a fresh page per 4 KiB, which perf
+    // shows as ~42% of VMM time (shmem_alloc_and_add_folio + clear_page_rep).
+    {
+        let ret = unsafe {
+            libc::fallocate(mem_file.as_raw_fd(), 0, 0, total_mem_size as libc::off_t)
+        };
+        if ret != 0 {
+            info!(
+                "Live snapshot: fallocate failed ({}), continuing without pre-alloc",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
     // Create UFFD with WP support.
     let uffd = UffdBuilder::new()
         .require_features(FeatureFlags::PAGEFAULT_FLAG_WP | FeatureFlags::EVENT_REMOVE)
@@ -403,6 +428,11 @@ pub fn create_live_snapshot(
     let t_stream_start = std::time::Instant::now();
     let mut fault_pages_saved = 0usize;
 
+    // How many pages (written + skipped) to visit in the linear scan
+    // between fault checks.  Larger batches mean fewer, bigger
+    // remove_write_protection calls, reducing TLB shootdown IPIs.
+    const LINEAR_BATCH: usize = 4096;
+
     // Build page tracking table.
     let mut pages: Vec<PageEntry> = Vec::new();
     let mut file_offset: u64 = 0;
@@ -478,24 +508,75 @@ pub fn create_live_snapshot(
                 }
             }
             Ok(None) => {
-                // No fault pending — save the next unsaved page from the linear scan.
-                while linear_cursor < total_pages && pages[linear_cursor].saved {
+                // No fault pending — batch save contiguous unsaved pages
+                // from the linear scan, then remove write-protection for
+                // each contiguous run in a single ioctl (reducing TLB
+                // shootdown IPIs).
+                let mut run_ptr: *const u8 = std::ptr::null();
+                let mut run_len: usize = 0;
+                let mut run_offset: u64 = 0;
+                let mut has_run = false;
+
+                let mut pages_visited = 0usize;
+                while pages_visited < LINEAR_BATCH && linear_cursor < total_pages {
+                    pages_visited += 1;
+
+                    if pages[linear_cursor].saved {
+                        linear_cursor += 1;
+                        continue;
+                    }
+
+                    let page = &pages[linear_cursor];
+
+                    // Try to extend the current contiguous run.
+                    if has_run && page.ptr == unsafe { run_ptr.add(run_len) } {
+                        run_len += page.size;
+                    } else {
+                        // Flush previous run.
+                        if has_run {
+                            // SAFETY: run_ptr..+run_len is within guest memory.
+                            let data =
+                                unsafe { std::slice::from_raw_parts(run_ptr, run_len) };
+                            mem_file
+                                .write_all_at(data, run_offset)
+                                .map_err(|err| {
+                                    CreateSnapshotError::MemoryBackingFile("write", err)
+                                })?;
+                            uffd_ref
+                                .remove_write_protection(
+                                    run_ptr as *mut libc::c_void,
+                                    run_len,
+                                    true,
+                                )
+                                .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                        }
+                        run_ptr = page.ptr;
+                        run_offset = page.file_offset;
+                        run_len = page.size;
+                        has_run = true;
+                    }
+
+                    pages[linear_cursor].saved = true;
+                    saved_count += 1;
                     linear_cursor += 1;
                 }
 
-                if linear_cursor < total_pages {
-                    let page = &mut pages[linear_cursor];
-                    save_page(&mut mem_file, page)?;
-                    page.saved = true;
-                    saved_count += 1;
-
-                    // Remove write-protection for this page.
-                    let page_ptr = page.ptr as *mut libc::c_void;
+                // Flush final run.
+                if has_run {
+                    let data =
+                        unsafe { std::slice::from_raw_parts(run_ptr, run_len) };
+                    mem_file
+                        .write_all_at(data, run_offset)
+                        .map_err(|err| {
+                            CreateSnapshotError::MemoryBackingFile("write", err)
+                        })?;
                     uffd_ref
-                        .remove_write_protection(page_ptr, page.size, true)
+                        .remove_write_protection(
+                            run_ptr as *mut libc::c_void,
+                            run_len,
+                            true,
+                        )
                         .map_err(CreateSnapshotError::UffdWriteProtect)?;
-
-                    linear_cursor += 1;
                 }
             }
             Ok(Some(_)) => {
@@ -571,7 +652,7 @@ fn save_page(file: &File, page: &PageEntry) -> Result<(), CreateSnapshotError> {
     Ok(())
 }
 
-fn snapshot_state_to_file(
+pub(crate) fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
 ) -> Result<(), CreateSnapshotError> {

@@ -220,6 +220,19 @@
                 ]
             },
             {
+                "syscall": "fallocate",
+                "comment": "Used by bpf_fault live snapshot to pre-allocate the snapshot memory file on tmpfs, avoiding per-page allocation during streaming.",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "mode=0 (default allocation)"
+                    }
+                ]
+            },
+            {
                 "syscall": "madvise",
                 "comment": "Used by the VirtIO balloon device and by musl for some customer workloads. It is also used by aws-lc during random number generation. They setup a memory page that mark with MADV_WIPEONFORK to be able to detect forks. They also call it with -1 to see if madvise is supported in certain platforms."
             },
@@ -285,6 +298,19 @@
                         "op": "eq",
                         "val": 32769,
                         "comment": "libc::MAP_SHARED | libc::MAP_POPULATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Used by libbpf to mmap BPF ELF data and kernel BTF files",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "libc::MAP_PRIVATE"
                     }
                 ]
             },
@@ -569,6 +595,159 @@
                         "comment": "UFFDIO_WRITEPROTECT = 0xC018AA06"
                     }
                 ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_MAP_CREATE, used by bpf_fault live snapshot to create ring buffer map",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "BPF_MAP_CREATE = 0"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_MAP_UPDATE_ELEM, used by bpf_fault live snapshot to set up struct_ops map",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "BPF_MAP_UPDATE_ELEM = 2"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_PROG_LOAD, used by bpf_fault live snapshot to load BPF program",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 5,
+                        "comment": "BPF_PROG_LOAD = 5"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_BTF_LOAD, used by bpf_fault live snapshot to load program BTF",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 18,
+                        "comment": "BPF_BTF_LOAD = 18"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_LINK_CREATE, used by bpf_fault live snapshot to attach fault handler",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 28,
+                        "comment": "BPF_LINK_CREATE = 28"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_LINK_FAULT_OPS_CMD, used by bpf_fault live snapshot to enable/resolve write protection",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 38,
+                        "comment": "BPF_LINK_FAULT_OPS_CMD = 38"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_OBJ_GET_INFO_BY_FD, used by libbpf to query map/prog info after loading",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15,
+                        "comment": "BPF_OBJ_GET_INFO_BY_FD = 15"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_MAP_LOOKUP_ELEM, used by libbpf for feature probing during BPF object loading",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "BPF_MAP_LOOKUP_ELEM = 1"
+                    }
+                ]
+            },
+            {
+                "syscall": "bpf",
+                "comment": "BPF_MAP_DELETE_ELEM, used by libbpf for feature probing during BPF object loading",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3,
+                        "comment": "BPF_MAP_DELETE_ELEM = 3"
+                    }
+                ]
+            },
+            {
+                "syscall": "faccessat2",
+                "comment": "Used by libbpf to probe /sys/kernel/btf/vmlinux availability during BPF object loading"
+            },
+            {
+                "syscall": "uname",
+                "comment": "Used by libbpf to detect kernel version during BPF object loading"
+            },
+            {
+                "syscall": "memfd_create",
+                "comment": "Used by libbpf to create memfd for BTF data during BPF object loading"
+            },
+            {
+                "syscall": "openat",
+                "comment": "Used by libbpf to open /sys/kernel/btf/vmlinux and other kernel BTF files"
+            },
+            {
+                "syscall": "prlimit64",
+                "comment": "Used by libbpf to check RLIMIT_MEMLOCK for BPF map memory"
+            },
+            {
+                "syscall": "newfstatat",
+                "comment": "Used by libbpf (via musl) for file stat operations during BPF object loading"
+            },
+            {
+                "syscall": "dup3",
+                "comment": "Used by libbpf for fd management during BPF object loading"
+            },
+            {
+                "syscall": "getpid",
+                "comment": "Used by libbpf for log messages during BPF object loading"
+            },
+            {
+                "syscall": "dup",
+                "comment": "Used by libbpf for fd management during BPF object loading"
             }
         ]
     },
@@ -641,8 +820,8 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
-              "syscall": "getrandom",
-              "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
+                "syscall": "getrandom",
+                "comment": "getrandom is used by `HttpServer` to reinialize `HashMap` after moving to the API thread"
             },
             {
                 "syscall": "accept4",

@@ -162,6 +162,10 @@ impl ApiServer {
                     &METRICS.latencies_us.vmm_live_create_snapshot,
                     "create live snapshot",
                 )),
+                SnapshotType::LiveBpf => Some((
+                    &METRICS.latencies_us.vmm_live_bpf_create_snapshot,
+                    "create live-bpf snapshot",
+                )),
             },
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))

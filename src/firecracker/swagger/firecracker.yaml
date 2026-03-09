@@ -1570,11 +1570,13 @@ definitions:
           - Full
           - Diff
           - Live
+          - LiveBpf
         description:
           Type of snapshot to create. It is optional and by default, a full
           snapshot is created. Live snapshots capture a point-in-time
           consistent snapshot with only a brief pause for state save, while
-          the VM continues running during the memory dump phase.
+          the VM continues running during the memory dump phase. LiveBpf
+          uses BPF fault_ops for write-protection instead of userfaultfd.
 
   NetworkOverride:
     type: object

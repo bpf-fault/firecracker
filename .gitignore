@@ -17,3 +17,6 @@ tags
 /resources/linux
 /resources/x86_64
 /resources/aarch64
+/resources/bpf/*.bpf.o
+/resources/bpf/vmlinux.h
+.*
