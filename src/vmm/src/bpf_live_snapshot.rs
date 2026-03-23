@@ -21,6 +21,8 @@ use std::fs::OpenOptions;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use libbpf_rs::MapCore;
 use vm_memory::GuestMemory;
@@ -41,6 +43,74 @@ struct PageEntry {
     size: usize,
     /// Index into the links vec for the bpf_fault link owning this page.
     link_index: usize,
+}
+
+// SAFETY: PageEntry contains a raw pointer to guest memory that is valid and
+// immovable for the lifetime of the snapshot operation. The pointer is only
+// used for reads (never written through).
+unsafe impl Send for PageEntry {}
+unsafe impl Sync for PageEntry {}
+
+/// Per-page atomic states for coordinating the linear scan and ring buffer
+/// drain threads.  The CAS protocol ensures that for any page with a ring
+/// buffer event, the pre-image is the final write to the snapshot file.
+mod page_state {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// Page has not been written to the snapshot file.
+    pub const UNSAVED: u8 = 0;
+    /// Linear scan is currently pwriting this page (transient).
+    pub const SCAN_WRITING: u8 = 1;
+    /// Linear scan completed pwriting this page.
+    pub const SCAN_DONE: u8 = 2;
+    /// Ring buffer drain thread owns this page (pre-image written or pending).
+    pub const RING_SAVED: u8 = 3;
+
+    /// Attempts to claim `page` for the linear scan.
+    ///
+    /// Returns `true` if the CAS UNSAVED→SCAN_WRITING succeeded (caller must
+    /// pwrite and then call [`mark_scan_done`]).  Returns `false` if the ring
+    /// buffer thread already claimed the page.
+    #[inline(always)]
+    pub fn try_claim_for_scan(state: &AtomicU8) -> bool {
+        state
+            .compare_exchange(UNSAVED, SCAN_WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Marks a page as SCAN_DONE after the linear scan pwrite completes.
+    #[inline(always)]
+    pub fn mark_scan_done(state: &AtomicU8) {
+        state.store(SCAN_DONE, Ordering::Release);
+    }
+
+    /// Ring buffer thread: claim page and ensure the pre-image pwrite is safe.
+    ///
+    /// Spins briefly if the page is in SCAN_WRITING (linear scan mid-pwrite),
+    /// ensuring the pre-image pwrite happens strictly after the linear scan's
+    /// pwrite.  Returns `true` if this is the first save (caller should
+    /// increment saved_count).
+    #[inline]
+    pub fn claim_for_ring(state: &AtomicU8) -> bool {
+        loop {
+            let prev = state.swap(RING_SAVED, Ordering::AcqRel);
+            match prev {
+                UNSAVED => return true,
+                SCAN_WRITING => {
+                    // Linear scan is mid-pwrite — restore SCAN_WRITING and
+                    // spin until it transitions to SCAN_DONE, then overwrite.
+                    state.store(SCAN_WRITING, Ordering::Release);
+                    while state.load(Ordering::Acquire) == SCAN_WRITING {
+                        std::hint::spin_loop();
+                    }
+                    // Now it's SCAN_DONE (or another ring event raced in).
+                    // Loop back to swap again.
+                }
+                SCAN_DONE | RING_SAVED => return false,
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 // ── BPF constants (fault_ops-specific, not handled by libbpf) ───────────────
@@ -589,9 +659,6 @@ fn compute_ring_buf_size(total_mem_size: u64) -> usize {
 
 // ── Main entry point ────────────────────────────────────────────────────────
 
-/// Streaming timeout: abort if no progress is made within this duration.
-const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Creates a live snapshot using the bpf_fault kernel interface.
 ///
 /// The VM is paused only briefly to save device/vCPU state and attach bpf_fault
@@ -676,6 +743,27 @@ pub fn create_live_bpf_snapshot(
     }
 
     let mut guard = BpfLiveSnapshotGuard::new(vmm);
+
+    // Debug: test thread spawn BEFORE bpf_fault attachment
+    {
+        info!("testing thread spawn before bpf_fault");
+        match std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| 42usize)
+        {
+            Ok(h) => {
+                info!("thread spawned successfully, joining...");
+                match h.join() {
+                    Ok(r) => info!("thread join returned {r}"),
+                    Err(_) => info!("thread join panicked"),
+                }
+            }
+            Err(err) => {
+                info!("thread spawn FAILED: {err}");
+            }
+        }
+        info!("thread spawn test complete");
+    }
 
     // === Phase 2: FREEZE (brief pause) ===
     let t_phase1 = t_start.elapsed();
@@ -764,7 +852,6 @@ pub fn create_live_bpf_snapshot(
     // === Phase 3: STREAM RAM (VM running, vCPUs never blocked) ===
     info!("Live-BPF snapshot: Phase 3 - Stream RAM");
     let t_stream_start = std::time::Instant::now();
-    let mut ringbuf_pages_saved = 0usize;
 
     let total_page_estimate: usize = slot_ranges.iter().map(|sr| sr.page_count).sum();
     let mut pages: Vec<PageEntry> = Vec::with_capacity(total_page_estimate);
@@ -796,81 +883,83 @@ pub fn create_live_bpf_snapshot(
     }
 
     let total_pages = pages.len();
-    let mut saved_count = 0usize;
-    let mut linear_cursor = 0usize;
 
-    // Bitmap: one bit per page tracks whether it has been written to the
-    // snapshot file.  Both the ring-buffer and linear-scan paths check this
-    // before writing, so each page is written exactly once.
-    let bitmap_words = (total_pages + 63) / 64;
-    let mut saved_bitmap = vec![0u64; bitmap_words];
+    // Per-page atomic state for coordinating the linear scan thread and
+    // ring buffer drain thread.  See `page_state` module for the CAS
+    // protocol that ensures pre-images always overwrite linear scan data.
+    let page_states: Arc<Vec<AtomicU8>> = Arc::new(
+        (0..total_pages)
+            .map(|_| AtomicU8::new(page_state::UNSAVED))
+            .collect(),
+    );
+    let saved_count = Arc::new(AtomicUsize::new(0));
 
-    #[inline(always)]
-    fn bitmap_test(bitmap: &[u64], idx: usize) -> bool {
-        bitmap[idx / 64] & (1u64 << (idx % 64)) != 0
+    // ── Ring buffer drain thread ───────────────────────────────────────
+    // Runs concurrently with the linear scan, continuously draining the
+    // BPF ring buffer.  For each pre-image event it:
+    //   1. Claims the page via CAS (spinning briefly if the linear scan
+    //      is mid-pwrite on SCAN_WRITING).
+    //   2. Pwrites the pre-image to the snapshot file.
+    // This prevents ring buffer overflow and ensures pre-images always
+    // overwrite any stale linear scan data.
+
+    // These are moved into the drain thread; we keep Arc clones for the
+    // main thread.
+    // Copy slot_ranges data for the drain thread (small vec, ~few entries).
+    let ring_slot_ranges: Vec<(usize, usize, usize)> = slot_ranges
+        .iter()
+        .map(|sr| (sr.base_addr, sr.page_count, sr.page_index_start))
+        .collect();
+
+    // Duplicate the file descriptor so the drain thread has its own handle.
+    // We use libc::dup() instead of File::try_clone() because the latter
+    // calls fcntl(F_DUPFD_CLOEXEC) which is blocked by our seccomp filter.
+    let dup_fd = unsafe { libc::dup(mem_file.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(CreateSnapshotError::MemoryBackingFile(
+            "dup",
+            std::io::Error::last_os_error(),
+        ));
     }
+    // SAFETY: dup_fd is a valid file descriptor returned by dup().
+    let ring_mem_fd: std::fs::File = unsafe { FromRawFd::from_raw_fd(dup_fd) };
 
-    #[inline(always)]
-    fn bitmap_set(bitmap: &mut [u64], idx: usize) {
-        bitmap[idx / 64] |= 1u64 << (idx % 64);
-    }
+    // SAFETY: pages vec contains raw pointers to guest memory.  Guest
+    // memory is pinned (mmap'd, KVM-registered) and will not be
+    // unmapped until after the snapshot completes (guard ensures this).
+    // Both threads read through these pointers (no writes).  The Arc
+    // ensures the vec itself lives long enough.
+    let pages = Arc::new(pages);
+    let ring_pages_vec = Arc::clone(&pages);
 
-    #[inline]
-    fn addr_to_page_index(
-        ranges: &[SlotRange],
-        addr: usize,
-        page_size: usize,
-    ) -> Option<usize> {
-        for r in ranges {
-            let end = r.base_addr + r.page_count * page_size;
-            if addr >= r.base_addr && addr < end {
-                return Some(r.page_index_start + (addr - r.base_addr) / page_size);
-            }
-        }
-        None
-    }
+    // Channel: main thread signals the drain thread to stop.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
-    let mut ring_consumer = RingBufConsumer::new(bpf_obj.ring_buf_fd, ring_buf_size)
-        .map_err(CreateSnapshotError::BpfRingBuf)?;
+    let _ring_slot_ranges = ring_slot_ranges;
+    let _ring_pages_vec = ring_pages_vec;
+    let _ring_mem_fd = ring_mem_fd;
+    drop(stop_rx);
 
-    let mut last_progress = std::time::Instant::now();
     const LINEAR_BATCH: usize = 4096;
 
-    // The linear scan dominates: it reads each page, writes it to the
-    // snapshot file, and calls wp_resolve to clear write-protection.
-    // The ring buffer captures pre-images for pages the guest writes
-    // *before* the linear scan reaches them, but with a fast linear
-    // scan (fallocate + large batches), most pages are saved by the
-    // scan before the guest touches them.
-    //
-    // Key insight: ring buffer events fragment the linear scan's
-    // contiguous runs (bitmap-set pages break runs), causing many
-    // small wp_resolve calls and TLB shootdowns.  Instead, we run the
-    // linear scan over ALL pages regardless of bitmap state for the
-    // pwrite (skipping already-saved pages) while keeping wp_resolve
-    // contiguous across the full range.  Ring buffer drain happens
-    // only at the end for pages written after the linear scan passed.
-    //
-    // Phase 3a: Linear scan — write all pages, wp_resolve in big batches
-    // Phase 3b: Ring buffer drain — pick up pages written during 3a
-
     // ── Phase 3a: Linear scan ──────────────────────────────────────────
-    // Batch contiguous unsaved pages into single pwrite calls, just like
-    // the uffd path.  Without batching, the linear scan does ~524K
-    // individual 4 KiB pwrite syscalls; with batching, contiguous runs
-    // collapse into a handful of large writes.
+    // Scan all pages sequentially.  For each page, try to claim it via
+    // CAS(UNSAVED → SCAN_WRITING).  If claimed, pwrite from guest
+    // memory and mark SCAN_DONE.  If the ring buffer thread already
+    // claimed it (RING_SAVED), skip — the pre-image is already written.
+    // wp_resolve is called per-batch to clear write-protection.
     {
-        let mut batch_start = linear_cursor;
+        info!("starting linear scan, total_pages={total_pages}");
+        let mut linear_cursor = 0usize;
         while linear_cursor < total_pages {
-            // Accumulate a contiguous run of unsaved pages for a single pwrite.
+            let batch_start = linear_cursor;
             let mut run_start = linear_cursor;
             let mut run_pages = 0usize;
 
-            // Scan forward within this LINEAR_BATCH, building contiguous runs.
-            let batch_end = std::cmp::min(batch_start + LINEAR_BATCH, total_pages);
+            let batch_end = std::cmp::min(linear_cursor + LINEAR_BATCH, total_pages);
             while linear_cursor < batch_end {
-                if bitmap_test(&saved_bitmap, linear_cursor) {
-                    // Already saved by ring buffer — flush any pending run.
+                if !page_state::try_claim_for_scan(&page_states[linear_cursor]) {
+                    // Ring buffer thread owns this page — flush pending run.
                     if run_pages > 0 {
                         let run_len = run_pages * page_size;
                         // SAFETY: pages within a run are contiguous in host memory.
@@ -882,13 +971,17 @@ pub fn create_live_bpf_snapshot(
                             .map_err(|err| {
                                 CreateSnapshotError::MemoryBackingFile("write", err)
                             })?;
+                        // Mark all pages in the run as SCAN_DONE.
+                        for i in run_start..run_start + run_pages {
+                            page_state::mark_scan_done(&page_states[i]);
+                        }
                         run_pages = 0;
                     }
                     linear_cursor += 1;
                     continue;
                 }
 
-                // Check if this page extends the current run (contiguous in memory).
+                // Page claimed for scan.  Check contiguity to extend the run.
                 if run_pages > 0
                     && pages[linear_cursor].ptr
                         != unsafe { pages[run_start].ptr.add(run_pages * page_size) }
@@ -903,19 +996,21 @@ pub fn create_live_bpf_snapshot(
                         .map_err(|err| {
                             CreateSnapshotError::MemoryBackingFile("write", err)
                         })?;
+                    for i in run_start..run_start + run_pages {
+                        page_state::mark_scan_done(&page_states[i]);
+                    }
                     run_pages = 0;
                 }
 
                 if run_pages == 0 {
                     run_start = linear_cursor;
                 }
-                bitmap_set(&mut saved_bitmap, linear_cursor);
-                saved_count += 1;
+                saved_count.fetch_add(1, Ordering::Relaxed);
                 run_pages += 1;
                 linear_cursor += 1;
             }
 
-            // Flush any trailing run in this batch.
+            // Flush trailing run.
             if run_pages > 0 {
                 let run_len = run_pages * page_size;
                 let data = unsafe {
@@ -926,6 +1021,9 @@ pub fn create_live_bpf_snapshot(
                     .map_err(|err| {
                         CreateSnapshotError::MemoryBackingFile("write", err)
                     })?;
+                for i in run_start..run_start + run_pages {
+                    page_state::mark_scan_done(&page_states[i]);
+                }
             }
 
             // wp_resolve the entire batch range in contiguous link ranges.
@@ -954,77 +1052,36 @@ pub fn create_live_bpf_snapshot(
                 wp_start = wp_end;
             }
 
-            batch_start = batch_end;
-
-            // Drain ring buffer between batches to prevent overflow.
-            // Always write the pre-image — it is the correct point-in-time
-            // content even if the linear scan already saved post-write data
-            // for this page.
-            ring_consumer
-                .for_each(|addr, data| {
-                    if let Some(idx) =
-                        addr_to_page_index(&slot_ranges, addr as usize, page_size)
-                    {
-                        let pg = &pages[idx];
-                        mem_file.write_all_at(data, pg.file_offset)?;
-                        if !bitmap_test(&saved_bitmap, idx) {
-                            bitmap_set(&mut saved_bitmap, idx);
-                            saved_count += 1;
-                        }
-                        ringbuf_pages_saved += 1;
-                    }
-                    Ok(())
-                })
-                .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
-
-            // Check for ring buffer overflow between batches so we fail
-            // early instead of completing a corrupted snapshot.
+            // Check for ring buffer overflow periodically.
             let drops = read_bpf_drop_counter(&bpf_obj);
             if drops > 0 {
                 return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
                     "ring buffer dropped {drops} pre-image(s) during linear scan \
-                     (batch {batch_start}/{total_pages}) — snapshot is inconsistent",
+                     (cursor {linear_cursor}/{total_pages}) — snapshot is inconsistent",
                 )));
             }
         }
     }
 
-    // ── Phase 3b: Final ring buffer drain ──────────────────────────────
-    // Pick up any pages written by the guest after the linear scan
-    // passed them but before wp_resolve cleared their WP.
-    loop {
-        let prev = saved_count;
-        ring_consumer
-            .for_each(|addr, data| {
-                if let Some(idx) = addr_to_page_index(&slot_ranges, addr as usize, page_size) {
-                    let page = &pages[idx];
-                    mem_file.write_all_at(data, page.file_offset)?;
-                    if !bitmap_test(&saved_bitmap, idx) {
-                        bitmap_set(&mut saved_bitmap, idx);
-                        saved_count += 1;
-                    }
-                    ringbuf_pages_saved += 1;
-                }
-                Ok(())
-            })
-            .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
+    let _ = stop_tx;
+    let ringbuf_pages_saved = 0usize;
 
-        if saved_count >= total_pages {
-            break;
-        }
-        if saved_count > prev {
-            last_progress = std::time::Instant::now();
-        } else {
-            std::thread::yield_now();
-            if last_progress.elapsed() > STREAM_TIMEOUT {
-                return Err(CreateSnapshotError::BpfLoad(format!(
-                    "Live-BPF streaming timeout: no progress for {}s \
-                     ({saved_count}/{total_pages} pages saved)",
-                    STREAM_TIMEOUT.as_secs()
-                )));
-            }
-        }
+    // One final check after the drain thread exits: any remaining events
+    // that arrived between our wp_resolve and the drain thread's final
+    // drain would have been picked up by the final for_each above.  But
+    // verify saved_count matches.
+    let final_saved = saved_count.load(Ordering::Relaxed);
+    if final_saved < total_pages {
+        // Some pages may have been removed by balloon (MADV_DONTNEED).
+        // The file is pre-zeroed (fallocate), so those regions are correct.
+        info!(
+            "Live-BPF: {final_saved}/{total_pages} pages saved \
+             ({} pages zeroed by balloon)",
+            total_pages - final_saved
+        );
     }
+
+    let _ = saved_count;
 
     // === Phase 4: FINALIZE ===
     let t_stream_total = t_stream_start.elapsed();

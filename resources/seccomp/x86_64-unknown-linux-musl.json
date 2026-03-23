@@ -118,6 +118,22 @@
                 "comment": "sigaltstack is used by Rust stdlib to remove alternative signal stack during thread teardown."
             },
             {
+                "syscall": "clone3",
+                "comment": "Used by std::thread::spawn to create the ring buffer drain thread during BPF live snapshots."
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Used by Rust stdlib to set thread name (PR_SET_NAME) when spawning named threads."
+            },
+            {
+                "syscall": "rseq",
+                "comment": "Used by Rust stdlib / glibc when spawning new threads."
+            },
+            {
+                "syscall": "set_robust_list",
+                "comment": "Used by Rust stdlib / musl when spawning new threads."
+            },
+            {
                 "syscall": "getrandom",
                 "comment": "getrandom is used by aws-lc library which we consume in virtio-rng"
             },
