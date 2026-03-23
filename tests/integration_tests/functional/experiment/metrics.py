@@ -75,7 +75,7 @@ def _parse_live_snapshot_log(log_data):
 
     m = re.search(
         r"Phase 3 \(stream\) took (\d+) us, (\d+) pages total "
-        r"\((\d+) fault-driven, (\d+) linear-scan\)",
+        r"\((\d+) (?:fault-driven|ring-buffer), (\d+) linear-scan(?:, \d+ ring-drops)?\)",
         log_data,
     )
     if m:
@@ -89,7 +89,7 @@ def _parse_live_snapshot_log(log_data):
         metrics["finalize_us"] = int(m.group(1))
 
     m = re.search(
-        r"Live snapshot: complete in (\d+) us \(freeze/downtime=(\d+) us\)",
+        r"(?:Live snapshot|Live-BPF snapshot): complete in (\d+) us \(freeze/downtime=(\d+) us\)",
         log_data,
     )
     if m:

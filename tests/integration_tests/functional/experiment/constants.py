@@ -21,7 +21,7 @@ WORKLOAD_PARAMS = {
 }
 
 # Application workload experiment — reduced matrix per design doc §6.2
-APP_MEM_SIZES = [512, 2048]
+APP_MEM_SIZES = [2048, 4096, 8192]
 
 REDIS_WORKLOAD_PARAMS = {
     "redis_light": {"clients": 2,  "ops": "get"},       # read-heavy
@@ -142,4 +142,5 @@ CSV_FIELDS = [
     "ts_freeze_start_s",
     "ts_freeze_end_s",
     "timeseries_failed_samples",   # count of samples where host couldn't connect
+    "network_packets_dropped",
 ]

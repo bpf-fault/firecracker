@@ -21,12 +21,15 @@ from .experiment import (
     APP_MEM_SIZES,
     VCPU_COUNT,
     _boot_app_experiment_vm,
+    _boot_bpf_experiment_vm,
     _boot_experiment_vm,
     _check_workload_tools,
     _log_app_summary,
     _log_summary,
     _run_full_snapshot,
     _run_full_snapshot_app,
+    _run_live_bpf_snapshot,
+    _run_live_bpf_snapshot_app,
     _run_live_snapshot,
     _run_live_snapshot_app,
     _write_csv_row,
@@ -87,6 +90,30 @@ def test_live_snapshot_experiment(
     _log_summary(row)
 
 
+@pytest.mark.nonci
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("mem_size_mib", [256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("workload", ["idle", "light", "medium", "heavy"])
+@pytest.mark.parametrize("iteration", range(10))
+def test_live_bpf_snapshot_experiment(
+    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
+):
+    """Collect LiveBpf snapshot metrics under controlled memory workload."""
+    vm = _boot_bpf_experiment_vm(
+        microvm_factory, uvm_plain.kernel_file, uvm_plain.rootfs_file, mem_size_mib
+    )
+
+    row = _run_live_bpf_snapshot(vm, microvm_factory, mem_size_mib, workload, iteration)
+
+    # Attach key metrics to JUnit XML.
+    record_property("downtime_us", row.get("downtime_us", 0))
+    record_property("throughput_mibs", row.get("throughput_mibs", 0))
+    record_property("fault_fraction_pct", row.get("fault_fraction_pct", 0))
+
+    _write_csv_row(row)
+    _log_summary(row)
+
+
 # ---------------------------------------------------------------------------
 # Quick single-run comparison (useful for development / smoke testing)
 # ---------------------------------------------------------------------------
@@ -138,10 +165,22 @@ def test_snapshot_experiment_quick(
     _write_csv_row(live_row)
     _log_summary(live_row)
 
+    # Boot a fresh VM for the BPF live snapshot path (requires uid=0 jailer).
+    vm_bpf = _boot_bpf_experiment_vm(
+        microvm_factory, vm_full.kernel_file, vm_full.rootfs_file, mem_size_mib
+    )
+    bpf_row = _run_live_bpf_snapshot(
+        vm_bpf, microvm_factory, mem_size_mib, workload, iteration=0
+    )
+    _write_csv_row(bpf_row)
+    _log_summary(bpf_row)
+
     # --- Side-by-side summary ---
     full_dt = full_row.get("downtime_us", 0)
     live_dt = live_row.get("downtime_us", 0)
-    speedup = full_dt / live_dt if live_dt > 0 else float("inf")
+    bpf_dt = bpf_row.get("downtime_us", 0)
+    speedup_live = full_dt / live_dt if live_dt > 0 else float("inf")
+    speedup_bpf = full_dt / bpf_dt if bpf_dt > 0 else float("inf")
 
     logger.info("")
     logger.info("=" * 70)
@@ -149,27 +188,32 @@ def test_snapshot_experiment_quick(
         "COMPARISON: %d MiB, %s workload, %d vCPUs", mem_size_mib, workload, VCPU_COUNT
     )
     logger.info("=" * 70)
-    logger.info("                        Full          Live         Speedup")
+    logger.info("                        Full          Live         LiveBpf      Speedup")
     logger.info(
-        "  Downtime:        %8.1f ms    %8.1f ms    %8.1fx",
+        "  Downtime:       %8.1f ms    %8.1f ms    %8.1f ms    %6.1fx / %6.1fx",
         full_dt / 1000,
         live_dt / 1000,
-        speedup,
+        bpf_dt / 1000,
+        speedup_live,
+        speedup_bpf,
     )
     logger.info(
-        "  Wall-clock:      %8.1f ms    %8.1f ms",
+        "  Wall-clock:     %8.1f ms    %8.1f ms    %8.1f ms",
         full_row.get("total_us", 0) / 1000,
         live_row.get("total_us", 0) / 1000,
+        bpf_row.get("total_us", 0) / 1000,
     )
     logger.info(
-        "  Restore→SSH:     %8.1f ms    %8.1f ms",
+        "  Restore→SSH:    %8.1f ms    %8.1f ms    %8.1f ms",
         full_row.get("ssh_ready_ms", 0),
         live_row.get("ssh_ready_ms", 0),
+        bpf_row.get("ssh_ready_ms", 0),
     )
     if workload != "idle":
         logger.info(
-            "  Workload degr:        N/A         %6.1f %%",
+            "  Workload degr:       N/A         %6.1f %%      %6.1f %%",
             live_row.get("workload_degradation_pct", 0),
+            bpf_row.get("workload_degradation_pct", 0),
         )
     logger.info("=" * 70)
 
@@ -244,5 +288,23 @@ def test_live_snapshot_app_experiment(
     record_property("throughput_mibs", row.get("throughput_mibs", 0))
     record_property("fault_fraction_pct", row.get("fault_fraction_pct", 0))
     record_property("restore_api_ms", row.get("restore_api_ms", 0))
+    _write_csv_row(row)
+    _log_app_summary(row)
+
+
+@pytest.mark.nonci
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
+@pytest.mark.parametrize("workload", ["redis_light", "redis_mixed", "redis_heavy"])
+@pytest.mark.parametrize("iteration", range(10))
+def test_live_bpf_snapshot_app_experiment(
+    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
+):
+    """Collect live-bpf-snapshot metrics under Redis workload."""
+    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib, bpf=True)
+    _check_workload_tools(vm, workload)
+    row = _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
+    record_property("downtime_us", row.get("downtime_us", 0))
+    record_property("throughput_mibs", row.get("throughput_mibs", 0))
     _write_csv_row(row)
     _log_app_summary(row)

@@ -2,13 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """VM boot and snapshot helpers for the snapshot live experiment."""
 
+import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
 from framework.microvm import Snapshot, SnapshotType
 
 from .constants import VCPU_COUNT
+
+
+def _get_iface_dropped(vm):
+    """Return (rx_dropped, tx_dropped) for the VM's TAP device."""
+    result = subprocess.run(
+        ["ip", "netns", "exec", vm.netns.id, "ip", "-s", "-j", "link"],
+        capture_output=True, text=True, check=True,
+    )
+    for iface in json.loads(result.stdout):
+        stats = iface.get("stats64", iface.get("stats", {}))
+        rx = stats.get("rx", {})
+        tx = stats.get("tx", {})
+        return int(rx.get("dropped", 0)), int(tx.get("dropped", 0))
+    return 0, 0
 
 
 def _do_full_snapshot_timed(vm):
@@ -64,18 +80,25 @@ def _do_restore_timed(factory, snapshot):
     return rvm, timings
 
 
-def _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib):
+def _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib, *, bpf=False):
     """Boot a VM for application workload experiments.
 
     If EXPERIMENT_ROOTFS env var is set, builds a fresh VM using that rootfs.
     Otherwise uses uvm_plain directly.  Disables memory_monitor, spawns,
     configures with VCPU_COUNT vCPUs and mem_size_mib RAM, adds a net iface,
     and waits until SSH is ready.
+
+    Pass bpf=True to run the jailer as uid=0/gid=0 (required for CAP_BPF /
+    snapshot_live_bpf).
     """
     if os.environ.get("EXPERIMENT_ROOTFS"):
+        build_kwargs = {}
+        if bpf:
+            build_kwargs["jailer_kwargs"] = {"uid": 0, "gid": 0}
         vm = microvm_factory.build(
             kernel=uvm_plain.kernel_file,
             rootfs=Path(os.environ["EXPERIMENT_ROOTFS"]),
+            **build_kwargs,
         )
     else:
         vm = uvm_plain
@@ -88,6 +111,30 @@ def _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib):
     vm.add_net_iface()
     vm.start()
     vm.ssh.check_output("true")
+
+    return vm
+
+
+def _boot_bpf_experiment_vm(microvm_factory, kernel_file, rootfs_file, mem_size_mib):
+    """Boot a VM with uid=0/gid=0 jailer (required for CAP_BPF / bpf_fault)."""
+    vm = microvm_factory.build(
+        kernel=kernel_file,
+        rootfs=rootfs_file,
+        jailer_kwargs={"uid": 0, "gid": 0},
+        monitor_memory=False,
+    )
+    vm.spawn()
+    vm.basic_config(vcpu_count=VCPU_COUNT, mem_size_mib=mem_size_mib)
+    vm.add_net_iface()
+    vm.start()
+    vm.ssh.check_output("true")
+
+    # Condition memory: populate ~25% of guest RAM.
+    prefill_mib = max(mem_size_mib // 4, 16)
+    vm.ssh.check_output(
+        f"head -c {prefill_mib}M /dev/urandom > /tmp/prefill 2>/dev/null; sync",
+        timeout=120,
+    )
 
     return vm
 

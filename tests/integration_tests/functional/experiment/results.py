@@ -145,7 +145,7 @@ def _log_summary(row):
     )
     logger.info("-" * 70)
 
-    if mode == "live":
+    if mode in ("live", "live_bpf"):
         logger.info(
             "  Phase 1 (prepare):      %8.1f ms  [populate: %.1f ms]",
             row.get("phase1_us", 0) / 1000,
