@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
-use super::builder::build_and_boot_microvm;
 use super::bpf_live_snapshot::create_live_bpf_snapshot;
+use super::builder::build_and_boot_microvm;
 use super::persist::{create_live_snapshot, create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
@@ -324,6 +324,23 @@ pub enum LoadSnapshotError {
 pub type ApiRequest = Box<VmmAction>;
 /// Shorthand type for a response containing a boxed Result.
 pub type ApiResponse = Box<Result<VmmData, VmmActionError>>;
+
+/// Outcome of handling an API request.
+#[allow(missing_debug_implementations)]
+pub enum RequestOutcome {
+    /// Request completed synchronously; response is ready.
+    Immediate(Result<VmmData, VmmActionError>),
+    /// Live snapshot streaming started; response will be sent when the
+    /// background worker thread completes Phase 3 (RAM streaming).
+    Deferred {
+        /// Reference to the VMM for kick_devices() on completion.
+        vmm: Arc<Mutex<Vmm>>,
+        /// Timestamp for latency metrics.
+        create_start_us: u64,
+        /// Snapshot type (Live or LiveBpf) for metrics selection.
+        snapshot_type: SnapshotType,
+    },
+}
 
 /// Error type for `PrebootApiController::build_microvm_from_requests`.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -684,11 +701,24 @@ impl MmdsRequestHandler for RuntimeApiController {
 
 impl RuntimeApiController {
     /// Handles the incoming runtime `VmmAction` request and provides a response for it.
-    pub fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
+    ///
+    /// Most requests return `RequestOutcome::Immediate`. Live snapshot requests
+    /// return `RequestOutcome::Deferred` when a snapshot worker is available,
+    /// signaling that Phase 3 is running in the background.
+    pub fn handle_request(&mut self, request: VmmAction) -> RequestOutcome {
         use self::VmmAction::*;
         match request {
-            // Supported operations allowed post-boot.
+            // CreateSnapshot may return Deferred for live snapshots.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            // All other operations complete synchronously.
+            other => RequestOutcome::Immediate(self.handle_sync_request(other)),
+        }
+    }
+
+    /// Handles all synchronous (non-snapshot) API requests.
+    fn handle_sync_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
+        use self::VmmAction::*;
+        match request {
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -789,6 +819,8 @@ impl RuntimeApiController {
             | SetMemoryHotplugDevice(_)
             | StartMicroVm
             | UpdateMachineConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
+            // CreateSnapshot is handled in handle_request directly.
+            CreateSnapshot(_) => unreachable!(),
         }
     }
 
@@ -851,7 +883,7 @@ impl RuntimeApiController {
     fn create_snapshot(
         &mut self,
         create_params: &CreateSnapshotParams,
-    ) -> Result<VmmData, VmmActionError> {
+    ) -> RequestOutcome {
         if create_params.snapshot_type == SnapshotType::Diff {
             log_dev_preview_warning("Virtual machine diff snapshots", None);
         }
@@ -859,68 +891,84 @@ impl RuntimeApiController {
         let mut locked_vmm = self.vmm.lock().unwrap();
         let vm_info = VmInfo::from(&self.vm_resources);
         let create_start_us = get_time_us(ClockType::Monotonic);
+        let snapshot_type = create_params.snapshot_type;
 
-        match create_params.snapshot_type {
-            SnapshotType::Live => {
+        match snapshot_type {
+            SnapshotType::Live | SnapshotType::LiveBpf => {
                 if locked_vmm.instance_info.state != VmState::Running {
-                    return Err(VmmActionError::CreateSnapshot(
+                    return RequestOutcome::Immediate(Err(VmmActionError::CreateSnapshot(
                         CreateSnapshotError::VmmError(VmmError::VcpuPause),
-                    ));
+                    )));
                 }
-                create_live_snapshot(&mut locked_vmm, &vm_info, create_params)?;
-                let elapsed_time_us = update_metric_with_elapsed_time(
-                    &METRICS.latencies_us.vmm_live_create_snapshot,
-                    create_start_us,
-                );
-                info!(
-                    "'create live snapshot' VMM action took {} us.",
-                    elapsed_time_us
-                );
-            }
-            SnapshotType::LiveBpf => {
-                if locked_vmm.instance_info.state != VmState::Running {
-                    return Err(VmmActionError::CreateSnapshot(
-                        CreateSnapshotError::VmmError(VmmError::VcpuPause),
-                    ));
+
+                // Submit to the background worker — all phases run there.
+                let has_worker = locked_vmm.snapshot_worker.is_some();
+                if has_worker {
+                    let job = crate::snapshot_worker::SnapshotJob {
+                        vmm: Arc::clone(&self.vmm),
+                        vm_info: vm_info.clone(),
+                        params: create_params.clone(),
+                    };
+                    let worker = locked_vmm.snapshot_worker.as_ref().unwrap();
+                    if let Err(err) = worker.submit_snapshot_job(job) {
+                        return RequestOutcome::Immediate(Err(
+                            VmmActionError::CreateSnapshot(err),
+                        ));
+                    }
+                    let vmm_arc = Arc::clone(&self.vmm);
+                    drop(locked_vmm);
+                    return RequestOutcome::Deferred {
+                        vmm: vmm_arc,
+                        create_start_us,
+                        snapshot_type,
+                    };
                 }
-                create_live_bpf_snapshot(&mut locked_vmm, &vm_info, create_params)?;
-                let elapsed_time_us = update_metric_with_elapsed_time(
-                    &METRICS.latencies_us.vmm_live_bpf_create_snapshot,
-                    create_start_us,
-                );
+
+                // Fallback: no worker available, run synchronously.
+                let result = match snapshot_type {
+                    SnapshotType::LiveBpf => create_live_bpf_snapshot(
+                        &mut locked_vmm,
+                        &vm_info,
+                        create_params,
+                    ),
+                    SnapshotType::Live => {
+                        create_live_snapshot(&mut locked_vmm, &vm_info, create_params)
+                    }
+                    _ => unreachable!(),
+                };
+                if let Err(err) = result {
+                    return RequestOutcome::Immediate(Err(VmmActionError::CreateSnapshot(err)));
+                }
+                let metric = match snapshot_type {
+                    SnapshotType::LiveBpf => &METRICS.latencies_us.vmm_live_bpf_create_snapshot,
+                    SnapshotType::Live => &METRICS.latencies_us.vmm_live_create_snapshot,
+                    _ => unreachable!(),
+                };
+                let elapsed_time_us = update_metric_with_elapsed_time(metric, create_start_us);
                 info!(
-                    "'create live-bpf snapshot' VMM action took {} us.",
-                    elapsed_time_us
+                    "'create {:?} snapshot' VMM action took {} us.",
+                    snapshot_type, elapsed_time_us
                 );
+                RequestOutcome::Immediate(Ok(VmmData::Empty))
             }
             _ => {
-                create_snapshot(&mut locked_vmm, &vm_info, create_params)?;
-                match create_params.snapshot_type {
-                    SnapshotType::Full => {
-                        let elapsed_time_us = update_metric_with_elapsed_time(
-                            &METRICS.latencies_us.vmm_full_create_snapshot,
-                            create_start_us,
-                        );
-                        info!(
-                            "'create full snapshot' VMM action took {} us.",
-                            elapsed_time_us
-                        );
-                    }
-                    SnapshotType::Diff => {
-                        let elapsed_time_us = update_metric_with_elapsed_time(
-                            &METRICS.latencies_us.vmm_diff_create_snapshot,
-                            create_start_us,
-                        );
-                        info!(
-                            "'create diff snapshot' VMM action took {} us.",
-                            elapsed_time_us
-                        );
-                    }
-                    SnapshotType::Live | SnapshotType::LiveBpf => unreachable!(),
+                let result = create_snapshot(&mut locked_vmm, &vm_info, create_params);
+                if let Err(err) = result {
+                    return RequestOutcome::Immediate(Err(VmmActionError::CreateSnapshot(err)));
                 }
+                let metric = match snapshot_type {
+                    SnapshotType::Full => &METRICS.latencies_us.vmm_full_create_snapshot,
+                    SnapshotType::Diff => &METRICS.latencies_us.vmm_diff_create_snapshot,
+                    _ => unreachable!(),
+                };
+                let elapsed_time_us = update_metric_with_elapsed_time(metric, create_start_us);
+                info!(
+                    "'create {:?} snapshot' VMM action took {} us.",
+                    snapshot_type, elapsed_time_us
+                );
+                RequestOutcome::Immediate(Ok(VmmData::Empty))
             }
         }
-        Ok(VmmData::Empty)
     }
 
     /// Updates block device properties:

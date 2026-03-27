@@ -50,7 +50,7 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
-use crate::vstate::memory::{GuestMemoryExtension, GuestRegionMmap};
+use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -318,7 +318,8 @@ pub fn build_microvm_for_boot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
-        populate_pages_handle: None,
+
+        snapshot_worker: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -342,21 +343,16 @@ pub fn build_microvm_for_boot(
         )
         .map_err(VmmError::VcpuStart)?;
 
-    // Spawn a background thread to pre-populate guest memory PTEs via MADV_POPULATE_READ.
-    // This is O(RAM) work; doing it here (while the VM runs) means it will be done by the
-    // time a live snapshot is requested, so create_live_snapshot() can join instantly instead
-    // of blocking the VMM event loop for seconds.
-    // Must be spawned BEFORE apply_filter so the thread is not subject to the VMM seccomp filter.
+    // Spawn the snapshot worker thread before seccomp filters are applied
+    // (the VMM thread's filter does not allow clone/clone3).
+    // The worker runs populate_pages (MADV_POPULATE_READ on all guest memory)
+    // before entering its receive loop, replacing the old fc_populate thread.
     {
         let vm = vmm.lock().unwrap().vm.clone();
         let page_size = vm_resources.machine_config.huge_pages.page_size();
-        let handle = std::thread::Builder::new()
-            .name("fc_populate".to_owned())
-            .spawn(move || {
-                vm.guest_memory().populate_pages(page_size);
-            })
-            .expect("failed to spawn populate pages thread");
-        vmm.lock().unwrap().populate_pages_handle = Some(handle);
+        let (worker_handle, _join_handle) =
+            crate::snapshot_worker::SnapshotWorkerHandle::spawn(Some((vm, page_size)));
+        vmm.lock().unwrap().snapshot_worker = Some(worker_handle);
     }
 
     #[cfg(feature = "gdb")]
@@ -536,7 +532,8 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
-        populate_pages_handle: None,
+
+        snapshot_worker: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -550,6 +547,14 @@ pub fn build_microvm_from_snapshot(
 
     let vmm = Arc::new(Mutex::new(vmm));
     event_manager.add_subscriber(vmm.clone());
+
+    // Spawn the snapshot worker thread before seccomp filters are applied.
+    // No populate_pages needed for restored VMs.
+    {
+        let (worker_handle, _join_handle) =
+            crate::snapshot_worker::SnapshotWorkerHandle::spawn(None);
+        vmm.lock().unwrap().snapshot_worker = Some(worker_handle);
+    }
 
     // Load seccomp filters for the VMM thread.
     // Keep this as the last step of the building process.
@@ -855,7 +860,8 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
-            populate_pages_handle: None,
+    
+            snapshot_worker: None,
         }
     }
 

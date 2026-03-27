@@ -38,7 +38,7 @@ pub enum MemBackendType {
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSnapshotParams {
     /// This marks the type of snapshot we want to create.

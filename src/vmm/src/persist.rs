@@ -11,8 +11,9 @@ use std::mem::forget;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,7 @@ use crate::vstate::memory::{
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
+use crate::snapshot_worker::{SnapshotTimings, StreamingTask};
 use crate::{EventManager, Vmm, VmmError, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
@@ -167,6 +169,10 @@ pub enum CreateSnapshotError {
     BpfRingBuf(String),
     /// Ring buffer overflow during bpf_fault live snapshot — pre-images lost: {0}
     BpfRingBufOverflow(String),
+    /// A live snapshot is already in progress.
+    SnapshotInProgress,
+    /// Snapshot worker thread is not available: {0}
+    WorkerUnavailable(String),
 }
 
 /// Snapshot version
@@ -210,6 +216,8 @@ struct LiveSnapshotGuard<'a> {
     regions: Vec<UffdRegion>,
     paused: bool,
     devices_kicked: bool,
+    /// Set by `into_streaming_state` to suppress Drop cleanup after handoff.
+    handed_off: bool,
 }
 
 impl<'a> LiveSnapshotGuard<'a> {
@@ -220,12 +228,29 @@ impl<'a> LiveSnapshotGuard<'a> {
             regions: Vec::new(),
             paused: false,
             devices_kicked: false,
+            handed_off: false,
         }
+    }
+
+    /// Extracts the UFFD and regions for handoff to the streaming worker thread.
+    ///
+    /// After this call, the guard's Drop will not attempt any cleanup.
+    /// The caller is responsible for UFFD cleanup and calling `kick_devices()`
+    /// after streaming completes.
+    fn into_streaming_state(mut self) -> (Uffd, Vec<UffdRegion>) {
+        assert!(!self.paused, "must resume vCPUs before handoff");
+        let uffd = self.uffd.take().expect("uffd must be set before handoff");
+        let regions = std::mem::take(&mut self.regions);
+        self.handed_off = true;
+        (uffd, regions)
     }
 }
 
 impl Drop for LiveSnapshotGuard<'_> {
     fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
         // Remove write-protection and unregister all regions from UFFD.
         if let Some(ref uffd) = self.uffd {
             for region in &self.regions {
@@ -285,35 +310,211 @@ struct PageEntry {
     saved: bool,
 }
 
-/// Creates a live snapshot of the microVM.
-///
-/// The VM is paused only briefly to save device/vCPU state and enable
-/// write-protection. Memory is then streamed to the output file while
-/// the VM continues running. Writes to not-yet-saved pages are trapped
-/// via userfaultfd write-protect and saved before unblocking the vCPU.
-pub fn create_live_snapshot(
-    vmm: &mut Vmm,
-    vm_info: &VmInfo,
-    params: &CreateSnapshotParams,
-) -> Result<(), CreateSnapshotError> {
-    let page_size = vm_info.huge_pages.page_size();
-    let t_start = std::time::Instant::now();
+/// All state needed for UFFD Phase 3 (RAM streaming) + Phase 4 (finalize,
+/// minus kick_devices). Transferred to the snapshot worker thread.
+pub(crate) struct UffdStreamingTask {
+    mem_file: File,
+    pages: Vec<PageEntry>,
+    page_index: BTreeMap<usize, usize>,
+    uffd: Uffd,
+    regions: Vec<UffdRegion>,
+    microvm_state: MicrovmState,
+    snapshot_path: PathBuf,
+    t_start: Instant,
+    t_freeze_total: Duration,
+}
 
-    // === Phase 1: PREPARE (VM still running) ===
+// SAFETY: All fields are either inherently Send or have been reviewed:
+// - PageEntry contains *const u8 pointing to stable guest memory mappings.
+// - UffdRegion contains *mut c_void (raw pointer, Send by definition).
+// - Uffd wraps a file descriptor; all operations are kernel ioctls (thread-safe).
+unsafe impl Send for UffdStreamingTask {}
+
+impl StreamingTask for UffdStreamingTask {
+    fn run(mut self: Box<Self>) -> Result<SnapshotTimings, CreateSnapshotError> {
+        info!("Live snapshot: Phase 3 - Stream RAM (worker thread)");
+        let t_stream_start = Instant::now();
+        let mut fault_pages_saved = 0usize;
+
+        const LINEAR_BATCH: usize = 4096;
+
+        let total_pages = self.pages.len();
+        let mut saved_count = 0usize;
+        let mut linear_cursor = 0usize;
+
+        while saved_count < total_pages {
+            match self.uffd.read_event() {
+                Ok(Some(userfaultfd::Event::Pagefault { addr, .. })) => {
+                    let fault_addr = addr as usize;
+                    if let Some((&page_start, &idx)) =
+                        self.page_index.range(..=fault_addr).next_back()
+                    {
+                        let page = &mut self.pages[idx];
+                        if !page.saved && fault_addr < page_start + page.size {
+                            save_page(&mut self.mem_file, page)?;
+                            page.saved = true;
+                            saved_count += 1;
+                            fault_pages_saved += 1;
+
+                            let page_ptr = page.ptr as *mut libc::c_void;
+                            self.uffd
+                                .remove_write_protection(page_ptr, page.size, true)
+                                .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                        }
+                    }
+                }
+                Ok(Some(userfaultfd::Event::Remove { start, end })) => {
+                    let start_addr = start as usize;
+                    let end_addr = end as usize;
+                    for (&page_start, &idx) in self.page_index.range(start_addr..end_addr) {
+                        let page = &mut self.pages[idx];
+                        if !page.saved && page_start >= start_addr && page_start < end_addr {
+                            page.saved = true;
+                            saved_count += 1;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let mut run_ptr: *const u8 = std::ptr::null();
+                    let mut run_len: usize = 0;
+                    let mut run_offset: u64 = 0;
+                    let mut has_run = false;
+
+                    let mut pages_visited = 0usize;
+                    while pages_visited < LINEAR_BATCH && linear_cursor < total_pages {
+                        pages_visited += 1;
+
+                        if self.pages[linear_cursor].saved {
+                            linear_cursor += 1;
+                            continue;
+                        }
+
+                        let page = &self.pages[linear_cursor];
+
+                        if has_run && page.ptr == unsafe { run_ptr.add(run_len) } {
+                            run_len += page.size;
+                        } else {
+                            if has_run {
+                                let data =
+                                    unsafe { std::slice::from_raw_parts(run_ptr, run_len) };
+                                self.mem_file
+                                    .write_all_at(data, run_offset)
+                                    .map_err(|err| {
+                                        CreateSnapshotError::MemoryBackingFile("write", err)
+                                    })?;
+                                self.uffd
+                                    .remove_write_protection(
+                                        run_ptr as *mut libc::c_void,
+                                        run_len,
+                                        true,
+                                    )
+                                    .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                            }
+                            run_ptr = page.ptr;
+                            run_offset = page.file_offset;
+                            run_len = page.size;
+                            has_run = true;
+                        }
+
+                        self.pages[linear_cursor].saved = true;
+                        saved_count += 1;
+                        linear_cursor += 1;
+                    }
+
+                    if has_run {
+                        let data =
+                            unsafe { std::slice::from_raw_parts(run_ptr, run_len) };
+                        self.mem_file
+                            .write_all_at(data, run_offset)
+                            .map_err(|err| {
+                                CreateSnapshotError::MemoryBackingFile("write", err)
+                            })?;
+                        self.uffd
+                            .remove_write_protection(
+                                run_ptr as *mut libc::c_void,
+                                run_len,
+                                true,
+                            )
+                            .map_err(CreateSnapshotError::UffdWriteProtect)?;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Err(err) => {
+                    return Err(CreateSnapshotError::UffdReadEvent(err));
+                }
+            }
+        }
+
+        // === Phase 4: FINALIZE (minus kick_devices) ===
+        let t_stream_total = t_stream_start.elapsed();
+        info!(
+            "Live snapshot: Phase 3 (stream) took {} us, {} pages total \
+             ({} fault-driven, {} linear-scan)",
+            t_stream_total.as_micros(),
+            total_pages,
+            fault_pages_saved,
+            total_pages - fault_pages_saved,
+        );
+        info!("Live snapshot: Phase 4 - Finalize (worker)");
+        let t_finalize_start = Instant::now();
+
+        // Unregister all memory from UFFD and drop it.
+        for region in &self.regions {
+            let _ = self.uffd.unregister(region.ptr, region.len);
+        }
+
+        snapshot_state_to_file(&self.microvm_state, &self.snapshot_path)?;
+
+        self.mem_file
+            .sync_all()
+            .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))?;
+
+        let t_total = self.t_start.elapsed();
+        let finalize_us = t_finalize_start.elapsed().as_micros();
+        info!("Live snapshot: Phase 4 (finalize) took {} us", finalize_us);
+        info!(
+            "Live snapshot: complete in {} us (freeze/downtime={} us)",
+            t_total.as_micros(),
+            self.t_freeze_total.as_micros(),
+        );
+
+        Ok(SnapshotTimings {
+            total_us: t_total.as_micros(),
+            freeze_us: self.t_freeze_total.as_micros(),
+            stream_us: t_stream_total.as_micros(),
+            finalize_us,
+            total_pages,
+            detail: format!(
+                "fault-driven={}, linear-scan={}",
+                fault_pages_saved,
+                total_pages - fault_pages_saved
+            ),
+        })
+    }
+}
+
+/// Result of Phase 1 UFFD preparation (no Vmm lock required).
+pub(crate) struct Phase1UffdResult {
+    /// Pre-allocated memory backing file.
+    pub mem_file: File,
+    /// Total guest memory size in bytes.
+    pub total_mem_size: u64,
+    /// Userfaultfd with WP capability.
+    pub uffd: Uffd,
+}
+
+/// Phase 1: Prepare file and UFFD (VM still running, no Vmm lock needed).
+///
+/// Creates the memory backing file, pre-allocates its blocks, and creates the
+/// userfaultfd.  Takes only `&Vm` (via `Arc<Vm>`) so it can run on the worker
+/// thread without holding the Vmm mutex.
+pub(crate) fn phase1_prepare_uffd(
+    vm: &crate::vstate::vm::Vm,
+    params: &CreateSnapshotParams,
+) -> Result<Phase1UffdResult, CreateSnapshotError> {
     info!("Live snapshot: Phase 1 - Prepare");
 
-    // Populate all RAM pages so PTEs exist (UFFDIO_WRITEPROTECT skips missing PTEs).
-    let t_populate_start = std::time::Instant::now();
-    if let Some(h) = vmm.populate_pages_handle.take() {
-        h.join().expect("populate_pages background thread panicked");
-    }
-    info!(
-        "Live snapshot: populate_pages join took {} us",
-        t_populate_start.elapsed().as_micros()
-    );
-
-    // Open/truncate memory output file.
-    let mut mem_file = OpenOptions::new()
+    let mem_file = OpenOptions::new()
         .create(true)
         .write(true)
         .read(true)
@@ -321,9 +522,7 @@ pub fn create_live_snapshot(
         .open(&params.mem_file_path)
         .map_err(|err| CreateSnapshotError::MemoryBackingFile("open", err))?;
 
-    // Calculate total guest memory size for the file.
-    let total_mem_size: u64 = vmm
-        .vm
+    let total_mem_size: u64 = vm
         .guest_memory()
         .iter()
         .flat_map(|region| region.slots())
@@ -333,10 +532,8 @@ pub fn create_live_snapshot(
         .set_len(total_mem_size)
         .map_err(|err| CreateSnapshotError::MemoryBackingFile("set_len", err))?;
 
-    // Pre-allocate the snapshot file's backing pages.  On tmpfs, pwrite()
-    // would otherwise allocate + zero a fresh page per 4 KiB, which perf
-    // shows as ~42% of VMM time (shmem_alloc_and_add_folio + clear_page_rep).
     {
+        // SAFETY: mem_file is a valid open fd.
         let ret = unsafe {
             libc::fallocate(mem_file.as_raw_fd(), 0, 0, total_mem_size as libc::off_t)
         };
@@ -348,7 +545,6 @@ pub fn create_live_snapshot(
         }
     }
 
-    // Create UFFD with WP support.
     let uffd = UffdBuilder::new()
         .require_features(FeatureFlags::PAGEFAULT_FLAG_WP | FeatureFlags::EVENT_REMOVE)
         .close_on_exec(true)
@@ -357,19 +553,32 @@ pub fn create_live_snapshot(
         .create()
         .map_err(CreateSnapshotError::UffdCreate)?;
 
-    // Set up RAII guard for cleanup. From this point on, all access to vmm goes
-    // through guard.vmm (which holds the mutable borrow).
+    Ok(Phase1UffdResult {
+        mem_file,
+        total_mem_size,
+        uffd,
+    })
+}
+
+/// Phase 2: Freeze VM, enable WP, resume, and build the streaming task.
+///
+/// Requires `&mut Vmm` (caller holds the Vmm mutex).  The guard ensures the
+/// VM is resumed and devices kicked on error.
+pub(crate) fn phase2_freeze_uffd(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    phase1: Phase1UffdResult,
+    params: &CreateSnapshotParams,
+    t_start: Instant,
+) -> Result<UffdStreamingTask, CreateSnapshotError> {
+    let page_size = vm_info.huge_pages.page_size();
+
     let mut guard = LiveSnapshotGuard::new(vmm);
-    guard.uffd = Some(uffd);
+    guard.uffd = Some(phase1.uffd);
 
     // === Phase 2: FREEZE (brief pause) ===
-    let t_phase1 = t_start.elapsed();
-    info!(
-        "Live snapshot: Phase 1 took {} us",
-        t_phase1.as_micros()
-    );
     info!("Live snapshot: Phase 2 - Freeze");
-    let t_freeze_start = std::time::Instant::now();
+    let t_freeze_start = Instant::now();
 
     guard
         .vmm
@@ -378,20 +587,14 @@ pub fn create_live_snapshot(
     guard.paused = true;
     let t_after_pause = t_freeze_start.elapsed();
 
-    // Save device + vCPU + KVM state.
     let microvm_state = guard
         .vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
     let t_after_save_state = t_freeze_start.elapsed();
 
-    // Register all plugged slots with UFFD in WP mode and enable write-protection.
-    let uffd_ref = guard.uffd.as_ref().expect("uffd was just created");
-
-    // guest_memory() returns a &GuestMemoryMmap (not an Arc), so the borrow cannot
-    // be held across mutable borrows of guard.vmm (pause/resume). We re-bind it in
-    // each phase where it's needed; the underlying data is the same throughout.
     {
+        let uffd_ref = guard.uffd.as_ref().expect("uffd was just created");
         let guest_memory = guard.vmm.vm.guest_memory();
         for region in guest_memory.iter() {
             for slot in region.plugged_slots() {
@@ -408,7 +611,6 @@ pub fn create_live_snapshot(
     }
     let t_after_wp = t_freeze_start.elapsed();
 
-    // Resume vCPUs (without kicking devices to avoid deadlock).
     guard
         .vmm
         .resume_vcpus_only()
@@ -425,223 +627,83 @@ pub fn create_live_snapshot(
         (t_freeze_total - t_after_wp).as_micros(),
     );
 
-    // === Phase 3: STREAM RAM (VM running) ===
-    info!("Live snapshot: Phase 3 - Stream RAM");
-    let t_stream_start = std::time::Instant::now();
-    let mut fault_pages_saved = 0usize;
-
-    // How many pages (written + skipped) to visit in the linear scan
-    // between fault checks.  Larger batches mean fewer, bigger
-    // remove_write_protection calls, reducing TLB shootdown IPIs.
-    const LINEAR_BATCH: usize = 4096;
-
     // Build page tracking table.
     let mut pages: Vec<PageEntry> = Vec::new();
     let mut file_offset: u64 = 0;
-    let guest_memory = guard.vmm.vm.guest_memory();
-    for region in guest_memory.iter() {
-        for (slot, plugged) in region.slots() {
-            let slot_len = slot.slice.len();
-            if plugged {
-                let base_ptr = slot.slice.ptr_guard().as_ptr();
-                for off in (0..slot_len).step_by(page_size) {
-                    let actual_size = std::cmp::min(page_size, slot_len - off);
-                    pages.push(PageEntry {
-                        // SAFETY: base_ptr + off is within the guest memory slot.
-                        ptr: unsafe { base_ptr.add(off) },
-                        file_offset: file_offset + off as u64,
-                        size: actual_size,
-                        saved: false,
-                    });
+    {
+        let guest_memory = guard.vmm.vm.guest_memory();
+        for region in guest_memory.iter() {
+            for (slot, plugged) in region.slots() {
+                let slot_len = slot.slice.len();
+                if plugged {
+                    let base_ptr = slot.slice.ptr_guard().as_ptr();
+                    for off in (0..slot_len).step_by(page_size) {
+                        let actual_size = std::cmp::min(page_size, slot_len - off);
+                        pages.push(PageEntry {
+                            // SAFETY: base_ptr + off is within the guest memory slot.
+                            ptr: unsafe { base_ptr.add(off) },
+                            file_offset: file_offset + off as u64,
+                            size: actual_size,
+                            saved: false,
+                        });
+                    }
                 }
+                file_offset += slot_len as u64;
             }
-            file_offset += slot_len as u64;
         }
     }
 
-    let total_pages = pages.len();
-    let mut saved_count = 0usize;
-    let mut linear_cursor = 0usize;
-
-    // Build index for O(log n) page fault lookup instead of O(n) linear scan.
     let page_index: BTreeMap<usize, usize> = pages
         .iter()
         .enumerate()
         .map(|(i, p)| (p.ptr as usize, i))
         .collect();
 
-    while saved_count < total_pages {
-        // Non-blocking check for WP faults.
-        let uffd_ref = guard.uffd.as_ref().expect("uffd exists");
-        match uffd_ref.read_event() {
-            Ok(Some(userfaultfd::Event::Pagefault { addr, .. })) => {
-                // Find and save the faulted page using BTreeMap for O(log n) lookup.
-                let fault_addr = addr as usize;
-                if let Some((&page_start, &idx)) =
-                    page_index.range(..=fault_addr).next_back()
-                {
-                    let page = &mut pages[idx];
-                    if !page.saved && fault_addr < page_start + page.size {
-                        save_page(&mut mem_file, page)?;
-                        page.saved = true;
-                        saved_count += 1;
-                        fault_pages_saved += 1;
+    // Extract UFFD + regions from guard — consumes guard, releases &mut Vmm.
+    let (uffd, regions) = guard.into_streaming_state();
+    let snapshot_path = params.snapshot_path.clone();
 
-                        // Remove write-protection (unblocks the faulting vCPU).
-                        let page_ptr = page.ptr as *mut libc::c_void;
-                        uffd_ref
-                            .remove_write_protection(page_ptr, page.size, true)
-                            .map_err(CreateSnapshotError::UffdWriteProtect)?;
-                    }
-                }
-            }
-            Ok(Some(userfaultfd::Event::Remove { start, end })) => {
-                // Balloon removed pages via madvise(MADV_DONTNEED).
-                // Use BTreeMap range query to find only affected pages.
-                let start_addr = start as usize;
-                let end_addr = end as usize;
-                for (&page_start, &idx) in page_index.range(start_addr..end_addr) {
-                    let page = &mut pages[idx];
-                    if !page.saved && page_start >= start_addr && page_start < end_addr {
-                        // File is sparse — unwritten regions are already zero.
-                        page.saved = true;
-                        saved_count += 1;
-                    }
-                }
-            }
-            Ok(None) => {
-                // No fault pending — batch save contiguous unsaved pages
-                // from the linear scan, then remove write-protection for
-                // each contiguous run in a single ioctl (reducing TLB
-                // shootdown IPIs).
-                let mut run_ptr: *const u8 = std::ptr::null();
-                let mut run_len: usize = 0;
-                let mut run_offset: u64 = 0;
-                let mut has_run = false;
+    Ok(UffdStreamingTask {
+        mem_file: phase1.mem_file,
+        pages,
+        page_index,
+        uffd,
+        regions,
+        microvm_state,
+        snapshot_path,
+        t_start,
+        t_freeze_total,
+    })
+}
 
-                let mut pages_visited = 0usize;
-                while pages_visited < LINEAR_BATCH && linear_cursor < total_pages {
-                    pages_visited += 1;
+/// Prepares a live UFFD snapshot (Phase 1 + Phase 2) and returns a streaming
+/// task.  Used by the synchronous fallback path when no worker is available.
+pub(crate) fn prepare_live_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<UffdStreamingTask, CreateSnapshotError> {
+    let t_start = Instant::now();
+    let phase1 = phase1_prepare_uffd(&vmm.vm, params)?;
+    let t_phase1 = t_start.elapsed();
+    info!("Live snapshot: Phase 1 took {} us", t_phase1.as_micros());
+    phase2_freeze_uffd(vmm, vm_info, phase1, params, t_start)
+}
 
-                    if pages[linear_cursor].saved {
-                        linear_cursor += 1;
-                        continue;
-                    }
-
-                    let page = &pages[linear_cursor];
-
-                    // Try to extend the current contiguous run.
-                    if has_run && page.ptr == unsafe { run_ptr.add(run_len) } {
-                        run_len += page.size;
-                    } else {
-                        // Flush previous run.
-                        if has_run {
-                            // SAFETY: run_ptr..+run_len is within guest memory.
-                            let data =
-                                unsafe { std::slice::from_raw_parts(run_ptr, run_len) };
-                            mem_file
-                                .write_all_at(data, run_offset)
-                                .map_err(|err| {
-                                    CreateSnapshotError::MemoryBackingFile("write", err)
-                                })?;
-                            uffd_ref
-                                .remove_write_protection(
-                                    run_ptr as *mut libc::c_void,
-                                    run_len,
-                                    true,
-                                )
-                                .map_err(CreateSnapshotError::UffdWriteProtect)?;
-                        }
-                        run_ptr = page.ptr;
-                        run_offset = page.file_offset;
-                        run_len = page.size;
-                        has_run = true;
-                    }
-
-                    pages[linear_cursor].saved = true;
-                    saved_count += 1;
-                    linear_cursor += 1;
-                }
-
-                // Flush final run.
-                if has_run {
-                    let data =
-                        unsafe { std::slice::from_raw_parts(run_ptr, run_len) };
-                    mem_file
-                        .write_all_at(data, run_offset)
-                        .map_err(|err| {
-                            CreateSnapshotError::MemoryBackingFile("write", err)
-                        })?;
-                    uffd_ref
-                        .remove_write_protection(
-                            run_ptr as *mut libc::c_void,
-                            run_len,
-                            true,
-                        )
-                        .map_err(CreateSnapshotError::UffdWriteProtect)?;
-                }
-            }
-            Ok(Some(_)) => {
-                // Other events (Fork, Remap, Unmap) — ignore.
-            }
-            Err(err) => {
-                return Err(CreateSnapshotError::UffdReadEvent(err));
-            }
-        }
-    }
-
-    // === Phase 4: FINALIZE ===
-    let t_stream_total = t_stream_start.elapsed();
-    info!(
-        "Live snapshot: Phase 3 (stream) took {} us, {} pages total \
-         ({} fault-driven, {} linear-scan)",
-        t_stream_total.as_micros(),
-        total_pages,
-        fault_pages_saved,
-        total_pages - fault_pages_saved,
-    );
-    info!("Live snapshot: Phase 4 - Finalize");
-    let t_finalize_start = std::time::Instant::now();
-
-    // Kick devices (deferred from resume).
-    //
-    // Note: unlike create_snapshot(), we do NOT call mark_virtio_queue_memory_dirty() here.
-    // Full/diff snapshots need it because they only dump dirty pages and might miss queue
-    // memory that was modified outside the dirty-tracking path. Live snapshots dump ALL
-    // guest memory pages, so virtio queue contents are captured as part of the streaming
-    // loop. On restore, the canonical device/queue state comes from the snapshot file
-    // (saved during Phase 2), not from the memory file, so any queue-page writes that
-    // occurred between Phase 2 and Phase 3 page save are harmless.
-    guard.vmm.kick_devices();
-    guard.devices_kicked = true;
-
-    // Unregister all memory from UFFD and drop it.
-    if let Some(ref uffd) = guard.uffd {
-        for region in &guard.regions {
-            let _ = uffd.unregister(region.ptr, region.len);
-        }
-    }
-    guard.regions.clear();
-    guard.uffd = None;
-
-    // Write device state to snapshot file.
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
-
-    // Sync memory file.
-    mem_file
-        .sync_all()
-        .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))?;
-
-    let t_total = t_start.elapsed();
-    info!(
-        "Live snapshot: Phase 4 (finalize) took {} us",
-        t_finalize_start.elapsed().as_micros()
-    );
-    info!(
-        "Live snapshot: complete in {} us (freeze/downtime={} us)",
-        t_total.as_micros(),
-        t_freeze_total.as_micros(),
-    );
+/// Creates a live snapshot of the microVM (synchronous).
+///
+/// This is a convenience wrapper that calls [`prepare_live_snapshot`]
+/// followed by running the streaming task synchronously on the current thread.
+/// For background streaming (to keep device I/O alive), use
+/// `prepare_live_snapshot` and submit the task to the snapshot worker.
+pub fn create_live_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
+    let task = prepare_live_snapshot(vmm, vm_info, params)?;
+    let _timings = Box::new(task).run()?;
+    vmm.kick_devices();
     Ok(())
 }
 

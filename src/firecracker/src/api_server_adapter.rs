@@ -1,21 +1,22 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
-use vmm::logger::{ProcessTimeReporter, error, info, warn};
+use vmm::logger::{METRICS, ProcessTimeReporter, error, info, update_metric_with_elapsed_time, warn};
 use vmm::resources::VmResources;
 use vmm::rpc_interface::{
-    ApiRequest, ApiResponse, BuildMicrovmFromRequestsError, PrebootApiController,
-    RuntimeApiController, VmmAction,
+    ApiRequest, ApiResponse, BuildMicrovmFromRequestsError, PrebootApiController, RequestOutcome,
+    RuntimeApiController, VmmAction, VmmActionError, VmmData,
 };
 use vmm::seccomp::BpfThreadMap;
 use vmm::vmm_config::instance_info::InstanceInfo;
+use vmm::vmm_config::snapshot::SnapshotType;
 use vmm::{EventManager, FcExitCode, Vmm};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
@@ -36,12 +37,32 @@ pub enum ApiServerError {
     BuildFromJson(crate::BuildFromJsonError),
 }
 
-#[derive(Debug)]
+/// Saved state for a deferred live snapshot response.
+struct DeferredSnapshotInfo {
+    vmm: Arc<Mutex<Vmm>>,
+    create_start_us: u64,
+    snapshot_type: SnapshotType,
+}
+
 struct ApiServerAdapter {
     api_event_fd: EventFd,
     from_api: Receiver<ApiRequest>,
     to_api: Sender<ApiResponse>,
     controller: RuntimeApiController,
+    /// True while a background snapshot is streaming.
+    snapshot_in_progress: bool,
+    /// Cloned completion EventFd from the snapshot worker, registered with epoll.
+    snapshot_completion_fd: Option<EventFd>,
+    /// State saved from the Deferred outcome for the completion handler.
+    deferred_snapshot: Option<DeferredSnapshotInfo>,
+}
+
+impl std::fmt::Debug for ApiServerAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiServerAdapter")
+            .field("snapshot_in_progress", &self.snapshot_in_progress)
+            .finish()
+    }
 }
 
 impl ApiServerAdapter {
@@ -60,6 +81,9 @@ impl ApiServerAdapter {
             from_api,
             to_api,
             controller: RuntimeApiController::new(vm_resources, vmm.clone()),
+            snapshot_in_progress: false,
+            snapshot_completion_fd: None,
+            deferred_snapshot: None,
         }));
         event_manager.add_subscriber(api_adapter);
         loop {
@@ -76,18 +100,125 @@ impl ApiServerAdapter {
         Ok(())
     }
 
-    fn handle_request(&mut self, req_action: VmmAction) {
-        let response = self.controller.handle_request(req_action);
-        // Send back the result.
-        self.to_api
-            .send(Box::new(response))
-            .map_err(|_| ())
-            .expect("one-shot channel closed");
+    fn handle_request(&mut self, req_action: VmmAction, ops: &mut EventOps) {
+        // Reject concurrent snapshot requests.
+        if self.snapshot_in_progress && matches!(req_action, VmmAction::CreateSnapshot(_)) {
+            self.to_api
+                .send(Box::new(Err(VmmActionError::CreateSnapshot(
+                    vmm::persist::CreateSnapshotError::SnapshotInProgress,
+                ))))
+                .expect("one-shot channel closed");
+            return;
+        }
+
+        match self.controller.handle_request(req_action) {
+            RequestOutcome::Immediate(response) => {
+                self.to_api
+                    .send(Box::new(response))
+                    .expect("one-shot channel closed");
+            }
+            RequestOutcome::Deferred {
+                vmm,
+                create_start_us,
+                snapshot_type,
+            } => {
+                // Use dup() to clone the completion EventFd. We cannot use
+                // try_clone() because it calls fcntl(F_DUPFD_CLOEXEC) which
+                // is not in the VMM seccomp filter. dup() IS allowed.
+                let completion_fd = {
+                    let vmm_guard = vmm.lock().unwrap();
+                    let worker = vmm_guard
+                        .snapshot_worker
+                        .as_ref()
+                        .expect("worker must exist for Deferred");
+                    // SAFETY: completion_fd is a valid open fd.
+                    let raw = unsafe { libc::dup(worker.completion_fd.as_raw_fd()) };
+                    assert!(raw >= 0, "dup() failed for completion EventFd");
+                    // SAFETY: dup returned a valid new fd.
+                    unsafe { EventFd::from_raw_fd(raw) }
+                };
+
+                if let Err(err) = ops.add(Events::new(&completion_fd, EventSet::IN)) {
+                    error!("Failed to register snapshot completion event: {}", err);
+                    // If we can't register the event, fall back to sending an error.
+                    self.to_api
+                        .send(Box::new(Err(VmmActionError::CreateSnapshot(
+                            vmm::persist::CreateSnapshotError::WorkerUnavailable(
+                                format!("Failed to register completion event: {}", err),
+                            ),
+                        ))))
+                        .expect("one-shot channel closed");
+                    return;
+                }
+
+                self.snapshot_completion_fd = Some(completion_fd);
+                self.deferred_snapshot = Some(DeferredSnapshotInfo {
+                    vmm,
+                    create_start_us,
+                    snapshot_type,
+                });
+                self.snapshot_in_progress = true;
+                // Do NOT send API response — HTTP thread continues blocking on recv().
+            }
+        }
+    }
+
+    /// Handles the completion of a background snapshot streaming task.
+    fn handle_snapshot_completion(&mut self, ops: &mut EventOps) {
+        let completion_fd = self.snapshot_completion_fd.take().unwrap();
+        let _ = completion_fd.read();
+
+        // Remove from epoll.
+        let _ = ops.remove(Events::new(&completion_fd, EventSet::IN));
+
+        let info = self.deferred_snapshot.take().unwrap();
+        self.snapshot_in_progress = false;
+
+        // Collect result from worker.
+        let result = {
+            let vmm_guard = info.vmm.lock().unwrap();
+            vmm_guard
+                .snapshot_worker
+                .as_ref()
+                .expect("worker must exist")
+                .collect_result()
+        };
+
+        match result {
+            Ok(_timings) => {
+                // Kick devices to resume any deferred work.
+                info.vmm.lock().unwrap().kick_devices();
+
+                let metric = match info.snapshot_type {
+                    SnapshotType::LiveBpf => &METRICS.latencies_us.vmm_live_bpf_create_snapshot,
+                    SnapshotType::Live => &METRICS.latencies_us.vmm_live_create_snapshot,
+                    _ => unreachable!(),
+                };
+                let elapsed_time_us =
+                    update_metric_with_elapsed_time(metric, info.create_start_us);
+                info!(
+                    "'create {:?} snapshot' VMM action took {} us (background).",
+                    info.snapshot_type, elapsed_time_us
+                );
+                self.to_api
+                    .send(Box::new(Ok(VmmData::Empty)))
+                    .expect("one-shot channel closed");
+            }
+            Err(err) => {
+                // Still kick devices on error for cleanup.
+                info.vmm.lock().unwrap().kick_devices();
+                error!("Background snapshot failed: {}", err);
+                self.to_api
+                    .send(Box::new(Err(VmmActionError::CreateSnapshot(err))))
+                    .expect("one-shot channel closed");
+            }
+        }
     }
 }
+
 impl MutEventSubscriber for ApiServerAdapter {
     /// Handle a read event (EPOLLIN).
-    fn process(&mut self, event: Events, _: &mut EventOps) {
+    fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.fd();
         let event_set = event.event_set();
 
@@ -96,7 +227,7 @@ impl MutEventSubscriber for ApiServerAdapter {
             match self.from_api.try_recv() {
                 Ok(api_request) => {
                     let request_is_pause = *api_request == VmmAction::Pause;
-                    self.handle_request(*api_request);
+                    self.handle_request(*api_request, ops);
 
                     // If the latest req is a pause request, temporarily switch to a mode where we
                     // do blocking `recv`s on the `from_api` receiver in a loop, until we get
@@ -109,7 +240,7 @@ impl MutEventSubscriber for ApiServerAdapter {
                         loop {
                             let req = self.from_api.recv().expect("Error receiving API request.");
                             let req_is_resume = *req == VmmAction::Resume;
-                            self.handle_request(*req);
+                            self.handle_request(*req, ops);
                             if req_is_resume {
                                 break;
                             }
@@ -123,6 +254,12 @@ impl MutEventSubscriber for ApiServerAdapter {
                     panic!("The channel's sending half was disconnected. Cannot receive data.");
                 }
             };
+        } else if self
+            .snapshot_completion_fd
+            .as_ref()
+            .is_some_and(|fd| source == fd.as_raw_fd())
+        {
+            self.handle_snapshot_completion(ops);
         } else {
             error!("Spurious EventManager event for handler: ApiServerAdapter");
         }

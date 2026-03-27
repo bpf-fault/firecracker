@@ -99,6 +99,8 @@ pub mod pci;
     clippy::cast_sign_loss
 )]
 pub mod bpf_live_snapshot;
+/// Pre-spawned worker thread for live snapshot streaming.
+pub mod snapshot_worker;
 /// Save/restore utilities.
 pub mod persist;
 /// Resource store for configured microVM resources.
@@ -153,6 +155,7 @@ use crate::devices::virtio::net::Net;
 use crate::logger::{METRICS, MetricsError, error, info, warn};
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
+use crate::snapshot_worker::SnapshotWorkerHandle;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
@@ -318,9 +321,10 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
-    /// Handle for the background populate_pages thread spawned at VM boot.
-    /// Joined (waits for completion) at the start of live snapshot creation.
-    pub populate_pages_handle: Option<std::thread::JoinHandle<()>>,
+    /// Handle to the pre-spawned snapshot streaming worker thread.
+    /// Spawned before seccomp is applied. Used by live snapshot to offload
+    /// Phase 3 (RAM streaming) so the event manager can process device I/O.
+    pub snapshot_worker: Option<SnapshotWorkerHandle>,
 }
 
 impl Vmm {
