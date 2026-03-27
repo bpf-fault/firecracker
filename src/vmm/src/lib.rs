@@ -318,6 +318,9 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    /// Handle for the background populate_pages thread spawned at VM boot.
+    /// Joined (waits for completion) at the start of live snapshot creation.
+    pub populate_pages_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Vmm {

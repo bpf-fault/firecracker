@@ -39,7 +39,7 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemory, GuestMemoryExtension, GuestMemoryState, GuestRegionMmap, GuestRegionType,
+    self, GuestMemory, GuestMemoryState, GuestRegionMmap, GuestRegionType,
     MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
@@ -304,9 +304,11 @@ pub fn create_live_snapshot(
 
     // Populate all RAM pages so PTEs exist (UFFDIO_WRITEPROTECT skips missing PTEs).
     let t_populate_start = std::time::Instant::now();
-    vmm.vm.guest_memory().populate_pages(page_size);
+    if let Some(h) = vmm.populate_pages_handle.take() {
+        h.join().expect("populate_pages background thread panicked");
+    }
     info!(
-        "Live snapshot: populate_pages took {} us",
+        "Live snapshot: populate_pages join took {} us",
         t_populate_start.elapsed().as_micros()
     );
 

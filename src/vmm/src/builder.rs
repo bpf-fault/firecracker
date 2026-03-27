@@ -50,7 +50,7 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
-use crate::vstate::memory::GuestRegionMmap;
+use crate::vstate::memory::{GuestMemoryExtension, GuestRegionMmap};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
@@ -318,6 +318,7 @@ pub fn build_microvm_for_boot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        populate_pages_handle: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -340,6 +341,23 @@ pub fn build_microvm_for_boot(
                 .clone(),
         )
         .map_err(VmmError::VcpuStart)?;
+
+    // Spawn a background thread to pre-populate guest memory PTEs via MADV_POPULATE_READ.
+    // This is O(RAM) work; doing it here (while the VM runs) means it will be done by the
+    // time a live snapshot is requested, so create_live_snapshot() can join instantly instead
+    // of blocking the VMM event loop for seconds.
+    // Must be spawned BEFORE apply_filter so the thread is not subject to the VMM seccomp filter.
+    {
+        let vm = vmm.lock().unwrap().vm.clone();
+        let page_size = vm_resources.machine_config.huge_pages.page_size();
+        let handle = std::thread::Builder::new()
+            .name("fc_populate".to_owned())
+            .spawn(move || {
+                vm.guest_memory().populate_pages(page_size);
+            })
+            .expect("failed to spawn populate pages thread");
+        vmm.lock().unwrap().populate_pages_handle = Some(handle);
+    }
 
     #[cfg(feature = "gdb")]
     if let Some(gdb_socket_path) = &vm_resources.machine_config.gdb_socket_path {
@@ -518,6 +536,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        populate_pages_handle: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -836,6 +855,7 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
+            populate_pages_handle: None,
         }
     }
 

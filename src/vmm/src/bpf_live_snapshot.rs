@@ -29,7 +29,6 @@ use crate::Vmm;
 use crate::logger::{info, warn};
 use crate::persist::{CreateSnapshotError, VmInfo, snapshot_state_to_file};
 use crate::vmm_config::snapshot::CreateSnapshotParams;
-use crate::vstate::memory::GuestMemoryExtension;
 
 /// Page tracking entry for the bpf_fault live snapshot streaming phase.
 struct PageEntry {
@@ -619,9 +618,11 @@ pub fn create_live_bpf_snapshot(
     info!("Live-BPF snapshot: Phase 1 - Prepare");
 
     let t_populate_start = std::time::Instant::now();
-    vmm.vm.guest_memory().populate_pages(page_size);
+    if let Some(h) = vmm.populate_pages_handle.take() {
+        h.join().expect("populate_pages background thread panicked");
+    }
     info!(
-        "Live-BPF snapshot: populate_pages took {} us",
+        "Live-BPF snapshot: populate_pages join took {} us",
         t_populate_start.elapsed().as_micros()
     );
 
