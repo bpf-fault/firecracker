@@ -180,6 +180,11 @@ def _redis_workload_burst(host, n_ops, timeout, op, value_size, port=6379, netns
 # TCP backend
 # ---------------------------------------------------------------------------
 
+class _noop_lock:  # noqa: N801
+    """Trivial no-op context manager used when a handle has no samples_lock."""
+    def __enter__(self): return self
+    def __exit__(self, *_): pass
+
 def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None):
     """Start a daemon thread that samples Redis throughput at TIMESERIES_INTERVAL_S cadence.
 
@@ -209,34 +214,42 @@ def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None
     value_size = params.get("value_size", 128)
 
     samples = []          # [(t_rel_s, ops_per_sec, avg_ms, p50_ms, p99_ms, p999_ms, failed)]
+    samples_lock = threading.Lock()
     stop_event = threading.Event()
     start_wall = start_wall if start_wall is not None else time.monotonic()
 
+    def _fire(t_rel):
+        """Issue one burst and append the result stamped at issue time."""
+        ops, avg_ms, p50, p99, p999, failed = _redis_workload_burst(
+            guest_ip, TIMESERIES_SAMPLE_OPS, timeout=TIMESERIES_TIMEOUT_S,
+            op=op, value_size=value_size, netns_id=netns_id,
+        )
+        entry = (
+            round(t_rel, 3), ops,
+            round(avg_ms, 3), round(p50, 3), round(p99, 3), round(p999, 3),
+            failed,
+        )
+        with samples_lock:
+            samples.append(entry)
+
     def _loop():
         while not stop_event.is_set():
-            t_start = time.monotonic()
-            t_rel = t_start - start_wall
-            ops, avg_ms, p50, p99, p999, failed = _redis_workload_burst(
-                guest_ip, TIMESERIES_SAMPLE_OPS, timeout=TIMESERIES_TIMEOUT_S,
-                op=op, value_size=value_size, netns_id=netns_id,
-            )
-            samples.append((
-                round(t_rel, 3), ops,
-                round(avg_ms, 3), round(p50, 3), round(p99, 3), round(p999, 3),
-                failed,
-            ))
-            elapsed = time.monotonic() - t_start
-            stop_event.wait(max(0.0, TIMESERIES_INTERVAL_S - elapsed))
+            t_rel = time.monotonic() - start_wall
+            threading.Thread(target=_fire, args=(t_rel,), daemon=True).start()
+            stop_event.wait(TIMESERIES_INTERVAL_S)
 
     t = threading.Thread(target=_loop, daemon=True, name="ts_sampler")
     t.start()
-    return {"thread": t, "stop": stop_event, "samples": samples, "start_wall": start_wall}
+    return {"thread": t, "stop": stop_event, "samples": samples,
+            "samples_lock": samples_lock, "start_wall": start_wall}
 
 
 def _stop_timeseries_sampler(handle):
-    """Signal the sampler thread to stop and wait for it to finish."""
+    """Signal the sampler thread to stop and wait for in-flight samples to finish."""
     handle["stop"].set()
     handle["thread"].join(timeout=TIMESERIES_TIMEOUT_S + 2)
+    # Give in-flight _fire threads up to TIMESERIES_TIMEOUT_S to complete and append.
+    time.sleep(TIMESERIES_TIMEOUT_S + 0.2)
 
 
 def _write_timeseries_csv(handle, workload, mem_size_mib, mode, iteration):
@@ -244,10 +257,11 @@ def _write_timeseries_csv(handle, workload, mem_size_mib, mode, iteration):
     os.makedirs(TIMESERIES_DIR, exist_ok=True)
     name = f"{workload}_{mem_size_mib}mib_{mode}_iter{iteration:02d}.csv"
     path = os.path.join(TIMESERIES_DIR, name)
-    with open(path, "w", newline="") as f:
+    with handle.get("samples_lock", _noop_lock()), open(path, "w", newline="") as f:
+        sorted_samples = sorted(handle["samples"], key=lambda r: r[0])
         w = csv.writer(f)
         w.writerow(["t_ms", "t_rel_s", "throughput", "avg_ms", "p50_ms", "p99_ms", "p999_ms", "failed"])
-        for t_rel, ops, avg_ms, p50_ms, p99_ms, p999_ms, failed in handle["samples"]:
+        for t_rel, ops, avg_ms, p50_ms, p99_ms, p999_ms, failed in sorted_samples:
             w.writerow([
                 round(t_rel * 1000, 1),
                 t_rel,
