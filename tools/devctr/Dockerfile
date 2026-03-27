@@ -84,6 +84,8 @@ RUN apt-get update \
         libglib2.0-dev \
         # for crosvm (vhost-user-blk backend)
         libcap2 \
+        # for BPF compilation (bpf_live_snapshot)
+        bpftool libbpf-dev \
         # for debugging
         gdb strace trace-cmd \
     && rm -rf /var/lib/apt/lists/*
