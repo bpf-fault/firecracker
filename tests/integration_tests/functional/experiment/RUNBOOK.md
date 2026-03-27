@@ -188,17 +188,22 @@ Expected console output ends with a comparison table:
   Downtime:          383.6 ms        19.7 ms        19.5 ms      19.5x /   19.6x
 ```
 
-### 4b. App workload smoke test — single redis_light run (~1 min)
+### 4b. App workload smoke test — all 3 modes, redis_light, 2 GiB (~7 min)
+
+Runs full / live / live_bpf for redis_light at 2048 MiB, 1 iteration each,
+across both PCI configs (6 tests total).
 
 ```bash
 EXPERIMENT_ROOTFS=/srv/test_artifacts/ubuntu-24.04-app.ext4 \
 ./tools/devtool -y test -- \
-  "integration_tests/functional/test_snapshot_live_experiment.py::test_live_snapshot_app_experiment[vmlinux-5.10.245-PCI_ON-0-redis_light-2048]" \
+  -k "redis_light and 2048 and app_experiment and 0-redis" \
+  integration_tests/functional/test_snapshot_live_experiment.py \
   -s --log-cli-level=INFO -m ""
 ```
 
-Expected: `APP RUN: 2048 MiB, redis_light workload, live snapshot` with non-zero
-`Baseline ops/sec` and `Ops degradation` fields.
+Expected: `APP RUN: 2048 MiB, redis_light workload` for each mode with non-zero
+`Baseline ops/sec` and `Ops degradation` fields.  BPF degradation should be
+lower than UFFD (typically ~2% vs ~4–6%).
 
 ### 4c. Full synthetic experiment matrix (@nonci, several hours)
 
@@ -311,3 +316,68 @@ covers both synthetic and app results.
 
 Benchmarking is **decoupled** from analysis: tests only write CSV rows; the plot and
 analyze scripts only read CSV rows.  Neither calls the other.
+
+---
+
+## 8. Architecture notes
+
+### Thread model during live snapshot
+
+Firecracker runs one process per microVM with these threads:
+
+| Thread | Name | Role during snapshot |
+|--------|------|---------------------|
+| API | `fc_api` | Receives snapshot HTTP request, returns response |
+| VMM / event loop | `fc_vmm` | Validates request, submits job to worker, returns to epoll |
+| vCPU (x N) | `fc_vcpu N` | Continue running with write-protection enabled |
+| Snapshot worker | `fc_snap_work` | Executes all 4 snapshot phases |
+
+The worker thread is spawned before seccomp filters are applied and also runs
+`populate_pages` (MADV_POPULATE_READ) at boot before entering its receive loop.
+When a live snapshot is requested, the VMM thread submits a `SnapshotJob` to the
+worker via a bounded channel and immediately returns to its epoll loop.  The
+worker does:
+
+1. **Phase 1 (no Vmm lock)** — file creation, fallocate, BPF/UFFD setup
+2. **Phase 2 (brief Vmm lock)** — pause vCPUs, save state, enable WP, resume
+3. **Phase 3 (no Vmm lock)** — stream RAM to disk
+4. **Phase 4 (no Vmm lock)** — finalize, drop WP, sync file
+
+This keeps the event loop responsive for device I/O throughout the snapshot.
+
+### BPF streaming optimizations
+
+The BPF streaming path (`bpf_live_snapshot.rs`) uses two key optimizations
+modelled after QEMU's `bpf-fault-snapshot.c`:
+
+* **Drain-before-scan** — The ring buffer is drained *before* each linear scan
+  batch.  Pre-images captured by the BPF handler are saved and marked in a
+  bitmap; the linear scan skips those pages.  This eliminates the double-write
+  problem (linear scan saving stale data, then ring buffer overwriting with the
+  correct pre-image).
+
+* **Per-run wp_resolve** — Write-protection is resolved immediately after saving
+  each contiguous run of pages, not after the entire 4096-page batch.  This
+  minimises the window where guest writes to already-saved clean pages trigger
+  unnecessary BPF fault handler invocations.
+
+### BPF object compilation
+
+The BPF program (`resources/bpf/snapshot_fault_ops.bpf.c`) must be compiled
+against the running kernel's BTF.  The dev container includes `bpftool` and
+`libbpf-dev` for this purpose.  The `build.rs` script:
+
+1. Generates `vmlinux.h` from `/sys/kernel/btf/vmlinux` via `bpftool btf dump`
+2. Compiles the BPF C source with `clang -target bpf`
+3. Falls back to a pre-existing `.bpf.o` if either tool is missing
+
+To recompile on the host (outside the container):
+
+```bash
+cd resources/bpf
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+  -I/usr/local/include -I. -c snapshot_fault_ops.bpf.c -o snapshot_fault_ops.bpf.o
+```
+
+Then rebuild Firecracker so the new object is embedded via `include_bytes!`.
