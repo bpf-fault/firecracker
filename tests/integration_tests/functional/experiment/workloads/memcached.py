@@ -50,7 +50,12 @@ def _parse_memtier_output(output):
 
     Finds the 'Totals' line and extracts ops/sec, average latency, and
     latency percentiles.
-    Returns (ops, avg_us, p50_us, p99_us, p999_us).
+    Returns (ops, avg_us, p50_us, p95_us, p99_us, p999_us).
+
+    memtier's default text Totals line does not include a p95 column:
+      Type  Ops/sec  Hits/sec  Misses/sec  Avg Lat  p50  p99  p99.9  p99.99  KB/sec
+    p95 would require --print-percentiles and is not available here; it is
+    returned as 0.0.  p99.9 (p999) is at index 7.
     """
     ops = 0.0
     avg_us = p50 = p99 = p999 = 0.0
@@ -72,11 +77,13 @@ def _parse_memtier_output(output):
             pass
         break
 
-    return ops, avg_us, p50, p99, p999
+    # p95 is not in memtier's default text output; callers receive 0.0.
+    p95 = 0.0
+    return ops, avg_us, p50, p95, p99, p999
 
 
 def _measure_memcached_baseline(vm, workload):
-    """Run a 10-second memtier benchmark and return (ops, avg_us, p50, p99, p999)."""
+    """Run a 10-second memtier benchmark and return (ops, avg_us, p50, p95, p99, p999)."""
     params = MEMCACHED_WORKLOAD_PARAMS[workload]
     clients = params["clients"]
     ratio = params["ratio"]

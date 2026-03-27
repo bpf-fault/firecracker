@@ -10,7 +10,7 @@ from pathlib import Path
 
 from framework.microvm import Snapshot, SnapshotType
 
-from .constants import VCPU_COUNT
+from .constants import MEMORY_FILL_FRACTION, VCPU_COUNT
 
 
 def _get_iface_dropped(vm):
@@ -129,8 +129,8 @@ def _boot_bpf_experiment_vm(microvm_factory, kernel_file, rootfs_file, mem_size_
     vm.start()
     vm.ssh.check_output("true")
 
-    # Condition memory: populate ~25% of guest RAM.
-    prefill_mib = max(mem_size_mib // 4, 16)
+    # Condition memory: populate MEMORY_FILL_FRACTION of guest RAM.
+    prefill_mib = max(int(mem_size_mib * MEMORY_FILL_FRACTION), 16)
     vm.ssh.check_output(
         f"head -c {prefill_mib}M /dev/urandom > /tmp/prefill 2>/dev/null; sync",
         timeout=120,
@@ -160,8 +160,10 @@ def _boot_experiment_vm(uvm_plain, mem_size_mib):
     # Wait for SSH.
     vm.ssh.check_output("true")
 
-    # Condition memory: populate ~25% of guest RAM so there are backed pages.
-    prefill_mib = max(mem_size_mib // 4, 16)
+    # Condition memory: populate MEMORY_FILL_FRACTION of guest RAM so the
+    # snapshot streaming time is representative and matches the QEMU benchmark's
+    # --guest-memory-fill-bytes target (default ~75 % of guest RAM).
+    prefill_mib = max(int(mem_size_mib * MEMORY_FILL_FRACTION), 16)
     vm.ssh.check_output(
         f"head -c {prefill_mib}M /dev/urandom > /tmp/prefill 2>/dev/null; sync",
         timeout=120,

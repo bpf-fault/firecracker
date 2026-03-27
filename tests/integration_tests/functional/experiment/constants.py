@@ -10,6 +10,11 @@ import os
 
 VCPU_COUNT = 2
 
+# Fraction of guest RAM to touch during memory pre-conditioning.  Matches the
+# QEMU benchmark's --guest-memory-fill-bytes default of ~75 % of guest RAM so
+# that snapshot streaming time is comparable across the two hypervisors.
+MEMORY_FILL_FRACTION = 0.75
+
 # Workload configurations: (block_size, block_count, sleep_seconds)
 # Each iteration of the loop writes block_size * block_count bytes, then sleeps.
 # sleep(1) supports fractional seconds on Ubuntu (coreutils).
@@ -24,9 +29,12 @@ WORKLOAD_PARAMS = {
 APP_MEM_SIZES = [2048, 4096, 8192]
 
 REDIS_WORKLOAD_PARAMS = {
-    "redis_light": {"clients": 2,  "ops": "get"},       # read-heavy
-    "redis_mixed": {"clients": 10, "ops": "set,get"},   # balanced
-    "redis_heavy": {"clients": 50, "ops": "set"},       # write-heavy
+    # value_size=128 and pipeline=1 match the QEMU benchmark defaults
+    # (--benchmark-value-size 128, --benchmark-pipeline 1) for cross-hypervisor
+    # comparability.
+    "redis_light": {"clients": 2,  "ops": "get",     "value_size": 128, "pipeline": 1},
+    "redis_mixed": {"clients": 10, "ops": "set,get", "value_size": 128, "pipeline": 1},
+    "redis_heavy": {"clients": 50, "ops": "set",     "value_size": 128, "pipeline": 1},
 }
 
 MEMCACHED_WORKLOAD_PARAMS = {
@@ -66,6 +74,18 @@ TIMESERIES_DIR = os.path.join(os.path.dirname(RESULTS_FILE), "timeseries")
 #   duration, which matters when TIMESERIES_INTERVAL_S is small.
 TIMESERIES_INTERVAL_S = 0.1
 TIMESERIES_SAMPLE_OPS = 500
+
+# Timeseries backend selection.
+# "tcp"     — custom raw TCP RESP sampler (100ms resolution, configurable timeout)
+# "memtier" — host-side memtier_benchmark subprocess (1-second resolution, exact
+#             percentiles from memtier's JSON Time-Serie field, no per-request timeout)
+TIMESERIES_BACKEND = "tcp"
+
+# Socket timeout for the TCP backend's per-sample recv() calls (seconds).
+# Raised from 0.25 to 2.0 so that slow responses during the UFFD write-protect
+# streaming phase are captured as real high-latency data points rather than
+# being uniformly clipped to "failed".
+TIMESERIES_TIMEOUT_S = 2.0
 
 CSV_FIELDS = [
     "timestamp",
@@ -110,14 +130,17 @@ CSV_FIELDS = [
     "workload_degradation_pct",
     "actual_write_rate_mibs",
     # Application workloads (Redis / Memcached) — per-window
+    # p95 is extracted from redis-benchmark's nearest power-of-2 histogram
+    # bucket (≥95%).  For memcached (memtier text output) p95 is not available
+    # in the default Totals line and will be 0.
     "app_baseline_ops", "app_baseline_avg_us",
-    "app_baseline_p50_us", "app_baseline_p99_us", "app_baseline_p999_us",
+    "app_baseline_p50_us", "app_baseline_p95_us", "app_baseline_p99_us", "app_baseline_p999_us",
     "app_during_ops", "app_during_avg_us",
-    "app_during_p50_us",  "app_during_p99_us",  "app_during_p999_us",
+    "app_during_p50_us",  "app_during_p95_us",  "app_during_p99_us",  "app_during_p999_us",
     "app_ops_degradation_pct",
     # Post-snapshot measurements
     "post_snap_ops", "post_snap_avg_us",
-    "post_snap_p50_us", "post_snap_p99_us", "post_snap_p999_us",
+    "post_snap_p50_us", "post_snap_p95_us", "post_snap_p99_us", "post_snap_p999_us",
     "post_snap_throughput_mibs",
     # Overall run aggregates (across pre/during/post windows)
     "overall_ops_mean", "overall_ops_stddev",

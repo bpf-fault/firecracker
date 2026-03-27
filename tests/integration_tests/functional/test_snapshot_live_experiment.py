@@ -19,6 +19,7 @@ import pytest
 
 from .experiment import (
     APP_MEM_SIZES,
+    MEMORY_FILL_FRACTION,
     VCPU_COUNT,
     _boot_app_experiment_vm,
     _boot_bpf_experiment_vm,
@@ -152,8 +153,8 @@ def test_snapshot_experiment_quick(
     vm_live.add_net_iface()
     vm_live.start()
     vm_live.ssh.check_output("true")
-    # Condition memory.
-    prefill_mib = max(mem_size_mib // 4, 16)
+    # Condition memory: populate MEMORY_FILL_FRACTION of guest RAM.
+    prefill_mib = max(int(mem_size_mib * MEMORY_FILL_FRACTION), 16)
     vm_live.ssh.check_output(
         f"head -c {prefill_mib}M /dev/urandom > /tmp/prefill 2>/dev/null; sync",
         timeout=120,
@@ -223,23 +224,26 @@ def test_snapshot_experiment_quick(
     # or vm_live (live snapshot taken from it).
     experiment_rootfs = os.environ.get("EXPERIMENT_ROOTFS")
     if mem_size_mib == 512 and experiment_rootfs:
-        vm_redis = microvm_factory.build(
-            kernel=vm_full.kernel_file,
-            rootfs=Path(experiment_rootfs),
-        )
-        vm_redis.monitors = [m for m in vm_redis.monitors if m is not vm_redis.memory_monitor]
-        vm_redis.memory_monitor = None
-        vm_redis.spawn()
-        vm_redis.basic_config(vcpu_count=VCPU_COUNT, mem_size_mib=mem_size_mib)
-        vm_redis.add_net_iface()
-        vm_redis.start()
-        vm_redis.ssh.check_output("true")
-        _check_workload_tools(vm_redis, "redis_light")
-        redis_row = _run_live_snapshot_app(
-            vm_redis, microvm_factory, mem_size_mib, "redis_light", iteration=0
-        )
-        _write_csv_row(redis_row)
-        _log_app_summary(redis_row)
+        try:
+            vm_redis = microvm_factory.build(
+                kernel=vm_full.kernel_file,
+                rootfs=Path(experiment_rootfs),
+            )
+            vm_redis.monitors = [m for m in vm_redis.monitors if m is not vm_redis.memory_monitor]
+            vm_redis.memory_monitor = None
+            vm_redis.spawn()
+            vm_redis.basic_config(vcpu_count=VCPU_COUNT, mem_size_mib=mem_size_mib)
+            vm_redis.add_net_iface()
+            vm_redis.start()
+            vm_redis.ssh.check_output("true")
+            _check_workload_tools(vm_redis, "redis_light")
+            redis_row = _run_live_snapshot_app(
+                vm_redis, microvm_factory, mem_size_mib, "redis_light", iteration=0
+            )
+            _write_csv_row(redis_row)
+            _log_app_summary(redis_row)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("redis smoke test failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------

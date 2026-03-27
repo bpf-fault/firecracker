@@ -14,11 +14,11 @@ from .memcached import (
     _start_memcached_during_burst,
 )
 from .redis import (
+    _collect_redis_during_results,
     _measure_post_snapshot_redis,
     _measure_redis_baseline,
-    _parse_redis_benchmark_output,
+    _parse_memtier_json,
     _setup_redis,
-    _start_redis_background_workload,
     _start_redis_during_burst,
 )
 from .stream import (
@@ -95,10 +95,10 @@ __all__ = [
     "_measure_workload_throughput",
     "_stop_workload",
     "_setup_redis",
-    "_parse_redis_benchmark_output",
+    "_parse_memtier_json",
+    "_collect_redis_during_results",
     "_measure_redis_baseline",
     "_measure_post_snapshot_redis",
-    "_start_redis_background_workload",
     "_start_redis_during_burst",
     "_setup_memcached",
     "_parse_memtier_output",

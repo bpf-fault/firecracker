@@ -387,15 +387,8 @@ def plot_app_ops_degradation(grouped, outdir):
     width = 0.15
     x = range(n_wl)
 
-    mem_offsets = {
-        512:  -1.5,
-        2048: -0.5,
-    }
-    # Full snapshot is always 100 % degradation (VM paused).
-    full_offsets = {
-        512:  0.5,
-        2048: 1.5,
-    }
+    mem_offsets = {m: (-len(APP_MEM_SIZES) + 1 + 2 * i) for i, m in enumerate(APP_MEM_SIZES)}
+    full_offsets = {m: (-len(APP_MEM_SIZES) + 2 + 2 * i) for i, m in enumerate(APP_MEM_SIZES)}
 
     for i, mem in enumerate(APP_MEM_SIZES):
         live_vals = []
@@ -450,13 +443,16 @@ def plot_app_tail_latency(grouped, outdir):
 
     x = range(len(APP_WORKLOADS))
     width = 0.12
-    # Three windows × two memory sizes = 6 bar clusters per workload.
-    # Offsets: base-512, dur-512, post-512, base-2048, dur-2048, post-2048
-    offsets_512  = [-2.5, -1.5, -0.5]
-    offsets_2048 = [ 0.5,  1.5,  2.5]
+    # Three windows × N memory sizes = 3N bar clusters per workload.
+    _n = len(APP_MEM_SIZES)
+    _mem_offsets_lat = {
+        m: [(-_n * 1.5 + 3 * i + j) for j in range(3)]
+        for i, m in enumerate(APP_MEM_SIZES)
+    }
     mem_palettes = {
-        512:  ["#90CAF9", "#EF9A9A", "#A5D6A7"],   # blue / red / green
-        2048: ["#1565C0", "#B71C1C", "#2E7D32"],
+        APP_MEM_SIZES[0]: ["#90CAF9", "#EF9A9A", "#A5D6A7"],
+        APP_MEM_SIZES[1]: ["#1565C0", "#B71C1C", "#2E7D32"],
+        APP_MEM_SIZES[2] if _n > 2 else APP_MEM_SIZES[0]: ["#0D47A1", "#880E4F", "#1B5E20"],
     }
     window_labels = ["Baseline", "During snap", "Post-snap"]
 
@@ -474,7 +470,7 @@ def plot_app_tail_latency(grouped, outdir):
             field = "post_snap_p99_us" if "p99" in m else "post_snap_avg_us"
             return avg([r.get(field, 0) for r in rows])
 
-        for mem, offsets in [(512, offsets_512), (2048, offsets_2048)]:
+        for mem, offsets in [(m, _mem_offsets_lat[m]) for m in APP_MEM_SIZES]:
             palette = mem_palettes[mem]
             for j, (window, label) in enumerate(
                 [("baseline", "Baseline"), ("during", "During"), ("post", "Post-snap")]
@@ -517,15 +513,19 @@ def plot_stream_bandwidth(grouped, outdir):
     n_kernels = len(STREAM_KERNELS)
     x = range(n_kernels)
     width = 0.12
-    # Three windows × two memory sizes = 6 bar positions per kernel.
+    # Three windows × N memory sizes = 3N bar positions per kernel.
+    _n = len(APP_MEM_SIZES)
     palettes = {
-        512:  ["#A5D6A7", "#FFCC80", "#90CAF9"],   # green / orange / blue
-        2048: ["#1B5E20", "#E65100", "#0D47A1"],
+        APP_MEM_SIZES[0]: ["#A5D6A7", "#FFCC80", "#90CAF9"],
+        APP_MEM_SIZES[1]: ["#1B5E20", "#E65100", "#0D47A1"],
+        APP_MEM_SIZES[2] if _n > 2 else APP_MEM_SIZES[0]: ["#004D40", "#BF360C", "#0A237F"],
     }
-    offsets_512  = [-2.5, -1.5, -0.5]
-    offsets_2048 = [ 0.5,  1.5,  2.5]
+    _stream_offsets = {
+        m: [(-_n * 1.5 + 3 * i + j) for j in range(3)]
+        for i, m in enumerate(APP_MEM_SIZES)
+    }
 
-    for mem, offsets in [(512, offsets_512), (2048, offsets_2048)]:
+    for mem, offsets in [(m, _stream_offsets[m]) for m in APP_MEM_SIZES]:
         live_rows = grouped.get((mem, "stream", "live"), [])
         windows = [
             ("baseline", f"Baseline {mem} MiB"),
@@ -668,13 +668,15 @@ def plot_overall_avg_latency(grouped, outdir):
 
     x = range(len(APP_WORKLOADS))
     width = 0.18
-    # Full and live × two memory sizes = 4 bar positions per workload.
-    config = [
-        ("full", 512,  -1.5, "#BDBDBD"),
-        ("live", 512,  -0.5, "#90CAF9"),
-        ("full", 2048,  0.5, "#757575"),
-        ("live", 2048,  1.5, "#1565C0"),
-    ]
+    # Full and live × N memory sizes = 2N bar positions per workload.
+    _full_colors = ["#BDBDBD", "#757575", "#424242"]
+    _live_colors = ["#90CAF9", "#1565C0", "#0D47A1"]
+    _n = len(APP_MEM_SIZES)
+    config = []
+    for _i, _m in enumerate(APP_MEM_SIZES):
+        _base = (-_n + 2 * _i)
+        config.append(("full", _m, _base - 0.5, _full_colors[_i]))
+        config.append(("live", _m, _base + 0.5, _live_colors[_i]))
 
     for ax, baseline_f, during_f, post_f, ylabel, title in [
         (axes[0], "app_baseline_avg_us", "app_during_avg_us", "post_snap_avg_us",

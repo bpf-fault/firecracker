@@ -2,25 +2,48 @@
 # SPDX-License-Identifier: Apache-2.0
 """Timeseries sampling (throughput timeline for plot 16).
 
-The sampler runs on the host and connects to the guest Redis over its TAP IP
-using raw TCP RESP pipelining.  This means connection failures (VM paused or
-frozen) are directly observable as failed samples rather than SSH timeouts.
+Two backends are available, selected by ``TIMESERIES_BACKEND`` in constants.py:
+
+* ``"tcp"``     — raw TCP RESP sampler (100 ms resolution, ``TIMESERIES_TIMEOUT_S``
+                  timeout per sample).  Connection failures during VM freeze appear
+                  as ``failed=1`` rows; slow responses during UFFD streaming appear
+                  as real high-latency rows once the timeout is raised above 250 ms.
+
+* ``"memtier"`` — runs ``memtier_benchmark`` from the host via ``nsenter`` for the
+                  entire recording window, then parses the 1-second ``Time-Serie``
+                  buckets from its JSON output.  No per-request timeout; zero-
+                  throughput seconds during the snapshot pause are recorded as-is.
 """
 
 import csv
+import json
 import os
+import shutil
+import signal
 import socket
+import subprocess
+import tempfile
 import threading
 import time
 
 from .constants import (
+    REDIS_WORKLOAD_PARAMS,
+    TIMESERIES_BACKEND,
     TIMESERIES_DIR,
     TIMESERIES_INTERVAL_S,
     TIMESERIES_SAMPLE_OPS,
+    TIMESERIES_TIMEOUT_S,
 )
 
 
 CLONE_NEWNET = 0x40000000  # from <sched.h>
+
+# Number of sequential ops per sample used for per-op latency measurement.
+_TS_LAT_OPS = 50
+
+# memtier test-time ceiling (seconds).  The process is SIGINT-stopped early;
+# this value just needs to be larger than the longest possible recording window.
+_MEMTIER_MAX_DURATION_SEC = 120
 
 
 def _percentile(sorted_data, pct):
@@ -39,27 +62,53 @@ def _percentile(sorted_data, pct):
     return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
 
 
-def _redis_ping_burst(host, n_ops, timeout, port=6379, netns_id=None, n_lat_ops=50):
-    """Pipeline n_ops PING commands and measure per-op latency on the same connection.
+def _build_redis_cmd(op, value_size):
+    """Build a pipelineable RESP command for a single SET or GET op.
+
+    Uses a fixed key ``ts:k`` and a value of ``value_size`` zero bytes.
+    Returns (cmd_bytes, expected_response_bytes).
+    """
+    key = b"ts:k"
+    if op == "set":
+        val = b"x" * value_size
+        cmd = (
+            b"*3\r\n$3\r\nSET\r\n"
+            + b"$" + str(len(key)).encode() + b"\r\n" + key + b"\r\n"
+            + b"$" + str(len(val)).encode() + b"\r\n" + val + b"\r\n"
+        )
+        resp = b"+OK\r\n"
+    else:
+        # GET — use a simple inline GET on the fixed key.
+        cmd = (
+            b"*2\r\n$3\r\nGET\r\n"
+            + b"$" + str(len(key)).encode() + b"\r\n" + key + b"\r\n"
+        )
+        # Response is either a bulk string or a nil; we count response delimiters.
+        resp = b"\r\n"  # used only to count responses via occurrence counting
+    return cmd, resp
+
+
+def _redis_workload_burst(host, n_ops, timeout, op, value_size, port=6379, netns_id=None):
+    """Pipeline n_ops SET or GET commands and measure per-op latency.
 
     Returns (ops_per_sec, avg_ms, p50_ms, p99_ms, p999_ms, failed).
     ``failed`` is True when a connection error or timeout occurs.
 
     Two phases run on a single TCP connection:
-    1. Sequential pings (n_lat_ops × ~0.1 ms each) for real per-op latency.
+    1. Sequential ops (_TS_LAT_OPS) for real per-op latency measurement.
     2. Pipelined burst (n_ops) for throughput measurement.
 
+    Using the same operation type as the benchmark workload (SET or GET)
+    ensures that write-protect faults triggered by SET operations appear as
+    latency spikes in the timeseries, consistent with how the QEMU benchmark
+    derives its per-second timeseries from actual workload traffic.
+
     When ``netns_id`` is set the socket is created inside the named network
-    namespace (e.g. ``"netns-master-1"``).  The calling thread enters the
-    namespace for socket creation only and is restored immediately after;
-    the open socket remains valid in the original namespace because Linux
-    pins sockets to the namespace in which they were created.
+    namespace (e.g. ``"netns-master-1"``).
     ``setns(CLONE_NEWNET)`` affects only the calling thread (Linux ≥ 3.8).
     """
-    cmd = b"*1\r\n$4\r\nPING\r\n" * n_ops
-    expected_len = len(b"+PONG\r\n") * n_ops
-    single_cmd = b"*1\r\n$4\r\nPING\r\n"
-    single_expected_len = len(b"+PONG\r\n")
+    single_cmd, _ = _build_redis_cmd(op, value_size)
+    burst_cmd = single_cmd * n_ops
     netns_fd = self_fd = None
     _fail = (0.0, timeout * 1000, timeout * 1000, timeout * 1000, timeout * 1000, True)
     try:
@@ -71,52 +120,79 @@ def _redis_ping_burst(host, n_ops, timeout, port=6379, netns_id=None, n_lat_ops=
                 os.setns(netns_fd, CLONE_NEWNET)
             with socket.create_connection((host, port), timeout=timeout) as s:
                 s.settimeout(timeout)
-                # Phase 1: sequential pings for latency
+                # Phase 1: sequential ops for latency.
                 latencies = []
-                for _ in range(n_lat_ops):
+                for _ in range(_TS_LAT_OPS):
                     t0 = time.monotonic()
                     s.sendall(single_cmd)
                     buf = b""
-                    while len(buf) < single_expected_len:
-                        chunk = s.recv(single_expected_len)
+                    # Read until we get the first \r\n (end of status/bulk header).
+                    while b"\r\n" not in buf:
+                        chunk = s.recv(256)
                         if not chunk:
                             break
                         buf += chunk
+                    # For GET, drain the value bytes if present.
+                    if op == "get" and buf.startswith(b"$") and not buf.startswith(b"$-1"):
+                        header_end = buf.index(b"\r\n") + 2
+                        val_len_str = buf[1:buf.index(b"\r\n")]
+                        val_len = int(val_len_str) + 2  # +2 for trailing \r\n
+                        total_needed = header_end + val_len
+                        while len(buf) < total_needed:
+                            chunk = s.recv(total_needed - len(buf))
+                            if not chunk:
+                                break
+                            buf += chunk
                     latencies.append((time.monotonic() - t0) * 1000)
-                # Phase 2: pipelined burst for throughput
+                # Phase 2: pipelined burst for throughput.
                 t0 = time.monotonic()
-                s.sendall(cmd)
+                s.sendall(burst_cmd)
+                # Drain responses by counting \r\n occurrences until we have
+                # at least n_ops (each response ends with at least one \r\n).
                 buf = b""
-                while len(buf) < expected_len:
-                    chunk = s.recv(4096)
+                crlf_count = 0
+                while crlf_count < n_ops:
+                    chunk = s.recv(65536)
                     if not chunk:
                         break
                     buf += chunk
+                    crlf_count = buf.count(b"\r\n")
                 elapsed = time.monotonic() - t0
         finally:
             if netns_id:
                 os.setns(self_fd, CLONE_NEWNET)
                 os.close(netns_fd)
                 os.close(self_fd)
-        pongs = buf.count(b"+PONG")
-        if pongs == 0 or not latencies:
+        if not latencies or elapsed <= 0:
             return _fail
-        ops = pongs / elapsed if elapsed > 0 else 0.0
+        ops_per_sec = n_ops / elapsed
         sorted_lats = sorted(latencies)
         avg_ms = sum(latencies) / len(latencies)
         p50  = _percentile(sorted_lats, 50)
         p99  = _percentile(sorted_lats, 99)
         p999 = _percentile(sorted_lats, 99.9)
-        return ops, avg_ms, p50, p99, p999, False
+        return ops_per_sec, avg_ms, p50, p99, p999, False
     except Exception:  # noqa: BLE001
         return _fail
 
 
-def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None):  # noqa: ARG001 — workload reserved for future use
+# ---------------------------------------------------------------------------
+# TCP backend
+# ---------------------------------------------------------------------------
+
+def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None):
     """Start a daemon thread that samples Redis throughput at TIMESERIES_INTERVAL_S cadence.
 
     Connects to the guest Redis over its TAP IP using raw TCP RESP, so
     connection failures during VM pause/freeze appear as failed samples.
+    Slow responses (up to TIMESERIES_TIMEOUT_S) are recorded as real high-latency
+    data points rather than being clipped to "failed".
+
+    The sampler uses the same operation type (SET or GET) and value size as the
+    active workload, matching how the QEMU benchmark derives its per-second
+    timeseries directly from workload traffic.  This ensures write-protect
+    faults triggered by SET operations appear as latency spikes rather than
+    being masked by PING's trivial memory footprint.
 
     ``start_wall`` lets a second sampler share the same time origin as the
     first (pass ``handle["start_wall"]`` from the original sampler).  When
@@ -125,6 +201,13 @@ def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None
     Returns a handle dict for use with _stop_timeseries_sampler / _write_timeseries_csv.
     Only call for redis workloads.
     """
+    # Determine the operation and value size from the workload params.  For
+    # mixed workloads (set,get) use SET so that write-protect faults show up.
+    params = REDIS_WORKLOAD_PARAMS.get(workload, {})
+    ops_str = params.get("ops", "get")
+    op = "set" if "set" in ops_str else "get"
+    value_size = params.get("value_size", 128)
+
     samples = []          # [(t_rel_s, ops_per_sec, avg_ms, p50_ms, p99_ms, p999_ms, failed)]
     stop_event = threading.Event()
     start_wall = start_wall if start_wall is not None else time.monotonic()
@@ -133,8 +216,9 @@ def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None
         while not stop_event.is_set():
             t_start = time.monotonic()
             t_rel = t_start - start_wall
-            ops, avg_ms, p50, p99, p999, failed = _redis_ping_burst(
-                guest_ip, TIMESERIES_SAMPLE_OPS, timeout=0.25, netns_id=netns_id
+            ops, avg_ms, p50, p99, p999, failed = _redis_workload_burst(
+                guest_ip, TIMESERIES_SAMPLE_OPS, timeout=TIMESERIES_TIMEOUT_S,
+                op=op, value_size=value_size, netns_id=netns_id,
             )
             samples.append((
                 round(t_rel, 3), ops,
@@ -152,7 +236,7 @@ def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None
 def _stop_timeseries_sampler(handle):
     """Signal the sampler thread to stop and wait for it to finish."""
     handle["stop"].set()
-    handle["thread"].join(timeout=5)
+    handle["thread"].join(timeout=TIMESERIES_TIMEOUT_S + 2)
 
 
 def _write_timeseries_csv(handle, workload, mem_size_mib, mode, iteration):
@@ -173,5 +257,152 @@ def _write_timeseries_csv(handle, workload, mem_size_mib, mode, iteration):
                 round(p99_ms, 3),
                 round(p999_ms, 3),
                 1 if failed else 0,
+            ])
+    return f"timeseries/{name}"
+
+
+# ---------------------------------------------------------------------------
+# memtier backend
+# ---------------------------------------------------------------------------
+
+def _memtier_ratio(ops_str):
+    """Convert a REDIS_WORKLOAD_PARAMS ops string to a memtier ``--ratio`` value."""
+    key = ops_str.lower()
+    if key == "set":
+        return "1:0"
+    if key == "get":
+        return "0:1"
+    return "1:1"
+
+
+def _start_timeseries_memtier(guest_ip, netns_id, workload, start_wall=None):
+    """Start a host-side memtier_benchmark process for timeseries collection.
+
+    Runs ``memtier_benchmark`` via ``nsenter`` with a generous ``--test-time``
+    ceiling.  The caller stops it early with ``_stop_timeseries_memtier`` once
+    the desired recording window has elapsed; memtier handles SIGINT gracefully
+    and writes its full JSON output (including per-second Time-Serie buckets)
+    before exiting.
+
+    Returns a handle dict for use with
+    ``_stop_timeseries_memtier`` / ``_write_timeseries_csv_from_memtier``.
+    Only call for redis workloads.
+    """
+    params = REDIS_WORKLOAD_PARAMS.get(workload, {})
+    tmp_dir = tempfile.mkdtemp(prefix="ts_memtier_")
+    json_path = os.path.join(tmp_dir, "ts.json")
+    cmd = [
+        "nsenter", f"--net=/var/run/netns/{netns_id}",
+        "memtier_benchmark",
+        "--server", guest_ip,
+        "--port", "6379",
+        "--protocol", "redis",
+        "--threads", "1",
+        "--clients", str(params.get("clients", 1)),
+        "--pipeline", str(params.get("pipeline", 1)),
+        "--ratio", _memtier_ratio(params.get("ops", "get")),
+        "--data-size", str(params.get("value_size", 128)),
+        "--test-time", str(_MEMTIER_MAX_DURATION_SEC),
+        "--json-out-file", json_path,
+        "--hide-histogram",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    start_wall = start_wall if start_wall is not None else time.monotonic()
+    return {
+        "proc": proc,
+        "json_path": json_path,
+        "tmp_dir": tmp_dir,
+        "start_wall": start_wall,
+    }
+
+
+def _stop_timeseries_memtier(handle):
+    """Send SIGINT to the memtier process and wait for it to write its JSON output.
+
+    memtier treats SIGINT as a graceful shutdown: it stops generating new
+    requests and writes the accumulated JSON (including Time-Serie) before
+    exiting.  Falls back to SIGKILL if it does not exit within 15 seconds.
+    """
+    proc = handle["proc"]
+    if proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    except OSError:
+        pass
+
+
+def _write_timeseries_csv_from_memtier(handle, workload, mem_size_mib, mode, iteration):  # noqa: ARG001  workload unused (for API symmetry)
+    """Parse the memtier JSON Time-Serie and write a timeseries CSV.
+
+    Each 1-second bucket from memtier's ``Time-Serie`` field becomes one CSV
+    row.  The format is identical to ``_write_timeseries_csv`` so that the
+    plotting code works unchanged.
+
+    Latency values in memtier's JSON are in milliseconds; they are written
+    directly (the CSV columns use ``_ms`` suffix).
+
+    The ``failed`` column is always ``0`` — memtier does not have a per-request
+    timeout.  Zero-throughput seconds during the snapshot pause appear naturally
+    as ``throughput=0`` rows.
+
+    Returns the relative path string and cleans up the temporary directory.
+    """
+    json_path = handle["json_path"]
+    tmp_dir = handle["tmp_dir"]
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+        totals = data["ALL STATS"]["Totals"]
+        time_serie = totals.get("Time-Serie") or {}
+        duration_sec = None
+        runtime = data["ALL STATS"].get("Runtime", {})
+        total_ms = runtime.get("Total duration")
+        if total_ms:
+            duration_sec = float(total_ms) / 1000.0
+
+        buckets = []
+        for key in sorted(time_serie.keys(), key=lambda k: int(k)):
+            bucket = time_serie[key]
+            bucket_start = float(int(key))
+            if duration_sec is not None:
+                bucket_end = min(duration_sec, bucket_start + 1.0)
+            else:
+                bucket_end = bucket_start + 1.0
+            bucket_dur = max(0.0, bucket_end - bucket_start)
+            if bucket_dur <= 0:
+                continue
+            count = float(bucket.get("Count") or 0)
+            throughput_rps = count / bucket_dur
+            avg_ms = float(bucket.get("Average Latency") or 0)
+            p50_ms  = float(bucket.get("p50.00") or bucket.get("p50") or 0)
+            p99_ms  = float(bucket.get("p99.00") or bucket.get("p99") or 0)
+            p999_ms = float(bucket.get("p99.90") or bucket.get("p999") or 0)
+            buckets.append((bucket_start, throughput_rps, avg_ms, p50_ms, p99_ms, p999_ms))
+    except Exception:  # noqa: BLE001
+        buckets = []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    os.makedirs(TIMESERIES_DIR, exist_ok=True)
+    name = f"{workload}_{mem_size_mib}mib_{mode}_iter{iteration:02d}.csv"
+    path = os.path.join(TIMESERIES_DIR, name)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_ms", "t_rel_s", "throughput", "avg_ms", "p50_ms", "p99_ms", "p999_ms", "failed"])
+        for t_rel_s, tput, avg_ms, p50_ms, p99_ms, p999_ms in buckets:
+            w.writerow([
+                round(t_rel_s * 1000, 1),
+                round(t_rel_s, 3),
+                round(tput, 1),
+                round(avg_ms, 3),
+                round(p50_ms, 3),
+                round(p99_ms, 3),
+                round(p999_ms, 3),
+                0,
             ])
     return f"timeseries/{name}"

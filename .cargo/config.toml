@@ -7,8 +7,13 @@ rustflags = [
 [net]
 git-fetch-with-cli = true
 
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
 [env]
 AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
 # disable AVX512 as it adds 600k of binary size
 # this was only used for MMDS token generation
 AWS_LC_SYS_CFLAGS = "-DMY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX"
+# GNU extension stubs for musl: argp + obstack are in libargp.a
+LIBS = "-largp"

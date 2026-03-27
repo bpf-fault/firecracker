@@ -17,7 +17,7 @@ DEFAULT_CSV = os.path.join(_repo_root(), "test_results", "experiment_results.csv
 
 MEM_SIZES = [256, 512, 1024, 2048, 4096]
 WORKLOADS = ["idle", "light", "medium", "heavy"]
-APP_MEM_SIZES = [512, 2048]
+APP_MEM_SIZES = [2048, 4096, 8192]
 APP_WORKLOADS = [
     "redis_light", "redis_mixed", "redis_heavy",
     "memcached_light", "memcached_heavy",

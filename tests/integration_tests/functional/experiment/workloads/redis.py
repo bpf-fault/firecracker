@@ -1,18 +1,107 @@
 # Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Redis workload helpers for the snapshot live experiment."""
+"""Redis workload helpers for the snapshot live experiment.
 
-import re
+All per-window load generation (baseline, during-snapshot, post-snapshot) runs
+from the HOST using ``memtier_benchmark`` connecting to the guest Redis over its
+TAP IP via ``nsenter``.  Running the load generator outside the VM means it
+keeps running during VM pause events, so latency spikes from the snapshot
+freeze are directly observable in per-window metrics — matching the QEMU
+benchmark methodology.
+
+``_setup_redis`` still uses SSH to configure redis-server inside the guest.
+"""
+
+import json
+import shutil
+import subprocess
+import tempfile
 import time
 
 from ..constants import REDIS_WORKLOAD_PARAMS
 
+# Duration for baseline and post-snapshot measurement windows (seconds).
+_MEASURE_DURATION_SEC = 10
 
-def _setup_redis(vm, mem_size_mib):
+# Duration for the during-snapshot measurement window (seconds).
+# Long enough to span the snapshot + UFFD streaming + recovery phases.
+_DURING_DURATION_SEC = 30
+
+# Warm-up delay after starting the during-snapshot process before returning.
+# Gives memtier time to ramp up to steady-state load before the snapshot fires.
+_DURING_WARMUP_SEC = 2
+
+
+def _memtier_ratio(ops_str):
+    """Convert a REDIS_WORKLOAD_PARAMS ops string to a memtier ``--ratio`` value."""
+    key = ops_str.lower()
+    if key == "set":
+        return "1:0"
+    if key == "get":
+        return "0:1"
+    return "1:1"  # "set,get" or any mixed form
+
+
+def _parse_memtier_json(json_path):
+    """Parse a memtier ``--json-out-file`` and return ``(ops, avg_us, p50_us, p95_us, p99_us, p999_us)``.
+
+    All latency values are converted from milliseconds to microseconds.
+    Returns all-zeros on parse failure.
+    """
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+        totals = data["ALL STATS"]["Totals"]
+
+        ops = float(totals.get("Ops/sec") or 0)
+
+        count = float(totals.get("Count") or 0)
+        accumulated = float(totals.get("Accumulated Latency") or 0)
+        if count > 0 and accumulated > 0:
+            avg_ms = accumulated / count
+        else:
+            avg_ms = float(totals.get("Average Latency") or totals.get("Latency") or 0)
+
+        pcts = totals.get("Percentile Latencies", {})
+        p50_ms  = float(pcts.get("p50.00") or 0)
+        p95_ms  = float(pcts.get("p95.00") or 0)
+        p99_ms  = float(pcts.get("p99.00") or 0)
+        p999_ms = float(pcts.get("p99.90") or 0)
+
+        # Convert ms → µs (our CSV fields use _us suffix).
+        return ops, avg_ms * 1000, p50_ms * 1000, p95_ms * 1000, p99_ms * 1000, p999_ms * 1000
+    except Exception:  # noqa: BLE001
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+
+def _memtier_cmd(guest_ip, netns_id, workload, json_path, duration_sec):
+    """Build a ``memtier_benchmark`` command list for host-side execution via ``nsenter``."""
+    params = REDIS_WORKLOAD_PARAMS[workload]
+    return [
+        "nsenter", f"--net=/var/run/netns/{netns_id}",
+        "memtier_benchmark",
+        "--server", guest_ip,
+        "--port", "6379",
+        "--protocol", "redis",
+        "--threads", "1",
+        "--clients", str(params["clients"]),
+        "--pipeline", str(params["pipeline"]),
+        "--ratio", _memtier_ratio(params["ops"]),
+        "--data-size", str(params["value_size"]),
+        "--test-time", str(int(duration_sec)),
+        "--json-out-file", str(json_path),
+        "--hide-histogram",
+    ]
+
+
+def _setup_redis(vm, mem_size_mib, value_size=128):
     """Start redis-server and pre-populate it.
 
     Allocates half of guest RAM as Redis maxmemory (allkeys-lru), then
-    pre-populates roughly 50 % of that budget with 512-byte string values.
+    pre-populates roughly 50 % of that budget.  ``value_size`` (bytes) should
+    match the workload's value_size so that key sizes and eviction behaviour
+    are consistent between pre-population and measurement.  Defaults to 128 to
+    match the QEMU benchmark's --benchmark-value-size default.
     Returns redis_maxmem in MiB.
     """
     redis_maxmem = mem_size_mib // 2
@@ -42,119 +131,85 @@ def _setup_redis(vm, mem_size_mib):
         timeout=15,
     )
 
-    # Pre-populate: target ~50 % of maxmemory using 512-byte values.
+    # Pre-populate: target ~50 % of maxmemory.  Use the same value_size as the
+    # workload measurements so eviction behaviour and memory pressure are
+    # consistent throughout the experiment.
     prefill_ops = redis_maxmem * 1024  # each op stores ~1 KiB key+value overhead
     vm.ssh.check_output(
-        f"redis-benchmark -t set -n {prefill_ops} -d 512 -r 1000000 -q",
+        f"redis-benchmark -t set -n {prefill_ops} -d {value_size} -r 1000000 -q",
         timeout=120,
     )
 
     return redis_maxmem
 
 
-def _parse_redis_benchmark_output(output):
-    """Parse redis-benchmark verbose output.
-
-    Returns (ops_per_sec, avg_us, p50_us, p99_us, p999_us).  Missing
-    values default to 0.0.  avg_us is extracted from the "latency summary"
-    table printed by redis-benchmark >= 6.x; falls back to 0.0 on older
-    versions that do not emit that section.
-    """
-    ops = 0.0
-    avg_us = p50 = p99 = p999 = 0.0
-
-    m = re.search(r"([\d.]+) requests per second", output)
-    if m:
-        ops = float(m.group(1))
-
-    # Average latency from the "latency summary" block (redis-benchmark >= 6).
-    # Format:
-    #   latency summary (msec):
-    #           avg       min       p50  ...
-    #         0.083     0.032     0.079  ...
-    m = re.search(
-        r"latency summary \(msec\):\s+avg\s+\S.*?\n\s+([\d.]+)",
-        output,
-        re.DOTALL,
-    )
-    if m:
-        avg_us = float(m.group(1)) * 1000
-
-    # Histogram lines: "  50.00% <= 0.103 milliseconds"
-    # redis-benchmark uses power-of-2 percentile buckets (50, 75, 87.5,
-    # 93.75, 98.44, 99.22, 99.61, 99.90, ...) — there is never an exact
-    # 99.00% or 99.90% line.  Use threshold matching instead: take the
-    # first bucket at or above each target percentile.
-    for line in output.splitlines():
-        m = re.match(r"\s*([\d.]+)%\s*<=\s*([\d.]+)\s*milliseconds", line)
-        if not m:
-            continue
-        pct = float(m.group(1))
-        lat_ms = float(m.group(2))
-        if abs(pct - 50.0) < 0.01:
-            p50 = lat_ms * 1000
-        elif 99.0 <= pct < 99.9 and p99 == 0.0:
-            p99 = lat_ms * 1000
-        elif pct >= 99.9 and p999 == 0.0:
-            p999 = lat_ms * 1000
-
-    return ops, avg_us, p50, p99, p999
-
-
 def _measure_redis_baseline(vm, workload):
-    """Run a 50 000-op redis-benchmark and return (ops, avg_us, p50, p99, p999)."""
-    params = REDIS_WORKLOAD_PARAMS[workload]
-    clients = params["clients"]
-    ops_arg = params["ops"]
+    """Run a {_MEASURE_DURATION_SEC}s memtier_benchmark from the host.
 
-    _, out, _ = vm.ssh.check_output(
-        f"redis-benchmark -t {ops_arg} -n 50000 -c {clients}",
-        timeout=60,
-    )
-    return _parse_redis_benchmark_output(out)
+    Returns ``(ops, avg_us, p50_us, p95_us, p99_us, p999_us)``.
+    """
+    guest_ip = vm.iface["eth0"]["iface"].guest_ip
+    netns_id = vm.netns.id
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        json_path = f.name
+    cmd = _memtier_cmd(guest_ip, netns_id, workload, json_path, _MEASURE_DURATION_SEC)
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=_MEASURE_DURATION_SEC + 30)
+        return _parse_memtier_json(json_path)
+    except Exception:  # noqa: BLE001
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    finally:
+        try:
+            import os
+            os.unlink(json_path)
+        except OSError:
+            pass
 
 
 def _measure_post_snapshot_redis(vm, workload):
-    """Run a post-snapshot redis-benchmark burst to measure recovery performance.
+    """Run a post-snapshot memtier_benchmark burst from the host.
 
-    Returns (ops, avg_us, p50, p99, p999).
+    Returns ``(ops, avg_us, p50_us, p95_us, p99_us, p999_us)``.
     """
     return _measure_redis_baseline(vm, workload)
 
 
-def _start_redis_background_workload(vm, workload):
-    """Launch a continuous redis-benchmark loop in the background.
+def _start_redis_during_burst(vm, workload, baseline_ops):  # noqa: ARG001  baseline_ops unused (fixed duration)
+    """Start a host-side memtier_benchmark run that spans the snapshot window.
 
-    Lets it settle for 2 s before returning.
+    The process runs for ``_DURING_DURATION_SEC`` seconds total.  This function
+    waits ``_DURING_WARMUP_SEC`` seconds before returning so the load is at
+    steady state when the caller triggers the snapshot.
+
+    Returns a handle dict for ``_collect_redis_during_results``.
     """
-    params = REDIS_WORKLOAD_PARAMS[workload]
-    clients = params["clients"]
-    ops_arg = params["ops"]
-
-    vm.ssh.check_output(
-        f"nohup sh -c '"
-        f"while true; do "
-        f"  redis-benchmark -t {ops_arg} -c {clients} -n 10000 -q 2>/dev/null; "
-        f"done' </dev/null >/dev/null 2>&1 &"
-    )
-    time.sleep(2)
+    guest_ip = vm.iface["eth0"]["iface"].guest_ip
+    netns_id = vm.netns.id
+    tmp_dir = tempfile.mkdtemp(prefix="memtier_during_")
+    json_path = f"{tmp_dir}/result.json"
+    cmd = _memtier_cmd(guest_ip, netns_id, workload, json_path, _DURING_DURATION_SEC)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(_DURING_WARMUP_SEC)
+    return {"proc": proc, "json_path": json_path, "tmp_dir": tmp_dir}
 
 
-def _start_redis_during_burst(vm, workload, baseline_ops):
-    """Launch a fixed-size redis-benchmark burst for the during-snapshot measurement.
+def _collect_redis_during_results(handle):
+    """Wait for the during-snapshot memtier process to finish and return metrics.
 
-    Targets ≈15 s of load.  Writes output to /tmp/redis_during.log and touches
-    /tmp/redis_during.done when complete.
+    Returns ``(ops, avg_us, p50_us, p95_us, p99_us, p999_us)``.
+    Cleans up the temporary directory regardless of outcome.
     """
-    params = REDIS_WORKLOAD_PARAMS[workload]
-    clients = params["clients"]
-    ops_arg = params["ops"]
-    n = max(50_000, int(baseline_ops * 15))
-
-    vm.ssh.check_output(
-        f"nohup sh -c '"
-        f"redis-benchmark -t {ops_arg} -c {clients} -n {n} "
-        f"> /tmp/redis_during.log 2>&1; "
-        f"touch /tmp/redis_during.done' "
-        f"</dev/null >/dev/null 2>&1 &"
-    )
+    proc = handle["proc"]
+    json_path = handle["json_path"]
+    tmp_dir = handle["tmp_dir"]
+    try:
+        try:
+            proc.wait(timeout=_DURING_DURATION_SEC + 30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        return _parse_memtier_json(json_path)
+    except Exception:  # noqa: BLE001
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
