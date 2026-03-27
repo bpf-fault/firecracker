@@ -17,17 +17,20 @@
 //! Only the fault_ops-specific link management (attach, WP enable/resolve)
 //! uses raw `bpf()` syscalls, since libbpf has no built-in fault_ops API.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use libbpf_rs::MapCore;
 use vm_memory::GuestMemory;
 
 use crate::Vmm;
 use crate::logger::{info, warn};
-use crate::persist::{CreateSnapshotError, VmInfo, snapshot_state_to_file};
+use crate::persist::{CreateSnapshotError, MicrovmState, VmInfo, snapshot_state_to_file};
+use crate::snapshot_worker::{SnapshotTimings, StreamingTask};
 use crate::vmm_config::snapshot::CreateSnapshotParams;
 
 /// Page tracking entry for the bpf_fault live snapshot streaming phase.
@@ -114,6 +117,17 @@ impl BpfFaultLink {
     }
 }
 
+// ── Slot range tracking ─────────────────────────────────────────────────────
+
+/// Tracks a contiguous range of pages within a single guest memory slot,
+/// mapping ring-buffer fault addresses to page indices and BPF link fds.
+struct SlotRange {
+    base_addr: usize,
+    page_count: usize,
+    page_index_start: usize,
+    link_index: usize,
+}
+
 // ── RAII guard ──────────────────────────────────────────────────────────────
 
 /// RAII guard for bpf_fault live snapshot.
@@ -122,6 +136,8 @@ struct BpfLiveSnapshotGuard<'a> {
     links: Vec<BpfFaultLink>,
     paused: bool,
     devices_kicked: bool,
+    /// Set by `into_streaming_state` to suppress Drop cleanup after handoff.
+    handed_off: bool,
 }
 
 impl<'a> BpfLiveSnapshotGuard<'a> {
@@ -131,12 +147,28 @@ impl<'a> BpfLiveSnapshotGuard<'a> {
             links: Vec::new(),
             paused: false,
             devices_kicked: false,
+            handed_off: false,
         }
+    }
+
+    /// Extracts the BPF links for handoff to the streaming worker thread.
+    ///
+    /// After this call, the guard's Drop will not attempt any cleanup.
+    /// The caller is responsible for dropping the links (which closes BPF fds
+    /// and removes WP) and calling `kick_devices()` after streaming completes.
+    fn into_streaming_state(mut self) -> Vec<BpfFaultLink> {
+        assert!(!self.paused, "must resume vCPUs before handoff");
+        let links = std::mem::take(&mut self.links);
+        self.handed_off = true;
+        links
     }
 }
 
 impl Drop for BpfLiveSnapshotGuard<'_> {
     fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
         self.links.clear();
         if self.paused
             && let Err(err) = self.vmm.resume_vcpus_only()
@@ -160,6 +192,12 @@ struct BpfFaultObject {
     /// Ring buffer map fd (borrowed from `_obj`, used for consuming pre-images).
     ring_buf_fd: RawFd,
 }
+
+// SAFETY: `BpfFaultObject` is transferred to the snapshot worker thread after
+// Phase 2. After handoff, only the worker thread accesses it (for reading the
+// drop counter via `read_bpf_drop_counter`). All underlying libbpf operations
+// are kernel syscalls on file descriptors, which are thread-safe.
+unsafe impl Send for BpfFaultObject {}
 
 /// Loads the BPF fault_ops program using libbpf-rs.
 ///
@@ -586,24 +624,339 @@ fn compute_ring_buf_size(total_mem_size: u64) -> usize {
     clamped.next_power_of_two().min(MAX_RING_BUF_SIZE)
 }
 
-// ── Main entry point ────────────────────────────────────────────────────────
+// ── Streaming task (runs on worker thread) ──────────────────────────────────
 
 /// Streaming timeout: abort if no progress is made within this duration.
-const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Creates a live snapshot using the bpf_fault kernel interface.
+/// All state needed for Phase 3 (RAM streaming) + Phase 4 (finalize, minus
+/// kick_devices). Transferred to the snapshot worker thread.
+pub(crate) struct BpfStreamingTask {
+    mem_file: File,
+    pages: Vec<PageEntry>,
+    saved_bitmap: Vec<u64>,
+    slot_ranges: Vec<SlotRange>,
+    ring_consumer: RingBufConsumer,
+    bpf_obj: BpfFaultObject,
+    links: Vec<BpfFaultLink>,
+    page_size: usize,
+    total_pages: usize,
+    microvm_state: MicrovmState,
+    snapshot_path: PathBuf,
+    t_start: Instant,
+    t_freeze_total: Duration,
+}
+
+// SAFETY: All fields are either inherently Send (File, Vec, PathBuf, etc.) or
+// have been individually reviewed:
+// - PageEntry contains *const u8 pointing to stable guest memory mappings
+//   that remain valid for the VM's lifetime (backed by Arc<Vm>).
+// - BpfFaultObject: see its unsafe impl Send above.
+// - RingBufConsumer: already has unsafe impl Send.
+// - BpfFaultLink wraps OwnedFd, which is Send.
+unsafe impl Send for BpfStreamingTask {}
+
+impl StreamingTask for BpfStreamingTask {
+    fn run(mut self: Box<Self>) -> Result<SnapshotTimings, CreateSnapshotError> {
+        // === Phase 3: STREAM RAM (VM running, vCPUs never blocked) ===
+        info!("Live-BPF snapshot: Phase 3 - Stream RAM (worker thread)");
+        let t_stream_start = Instant::now();
+        let mut ringbuf_pages_saved = 0usize;
+        let mut saved_count = 0usize;
+        let mut linear_cursor = 0usize;
+
+        let page_size = self.page_size;
+        let total_pages = self.total_pages;
+
+        #[inline(always)]
+        fn bitmap_test(bitmap: &[u64], idx: usize) -> bool {
+            bitmap[idx / 64] & (1u64 << (idx % 64)) != 0
+        }
+
+        #[inline(always)]
+        fn bitmap_set(bitmap: &mut [u64], idx: usize) {
+            bitmap[idx / 64] |= 1u64 << (idx % 64);
+        }
+
+        #[inline]
+        fn addr_to_page_index(
+            ranges: &[SlotRange],
+            addr: usize,
+            page_size: usize,
+        ) -> Option<usize> {
+            for r in ranges {
+                let end = r.base_addr + r.page_count * page_size;
+                if addr >= r.base_addr && addr < end {
+                    return Some(r.page_index_start + (addr - r.base_addr) / page_size);
+                }
+            }
+            None
+        }
+
+        let mut last_progress = Instant::now();
+        const LINEAR_BATCH: usize = 4096;
+
+        /// Writes a contiguous run of pages to the mem file and immediately
+        /// resolves write-protection for that run.
+        #[inline]
+        fn flush_run(
+            mem_file: &File,
+            pages: &[PageEntry],
+            links: &[BpfFaultLink],
+            run_start: usize,
+            run_pages: usize,
+            page_size: usize,
+        ) -> Result<(), CreateSnapshotError> {
+            let run_len = run_pages * page_size;
+            // SAFETY: pages within a run are contiguous in host memory.
+            let data =
+                unsafe { std::slice::from_raw_parts(pages[run_start].ptr, run_len) };
+            mem_file
+                .write_all_at(data, pages[run_start].file_offset)
+                .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
+
+            // Resolve WP immediately for this run so future guest writes
+            // to these pages don't trigger unnecessary BPF faults.
+            let link_idx = pages[run_start].link_index;
+            if let Err(err) = bpf_fault_wp_resolve(
+                links[link_idx].as_raw_fd(),
+                pages[run_start].ptr as u64,
+                run_len as u64,
+            ) {
+                warn!(
+                    "Live-BPF: wp_resolve failed at 0x{:x}: {err}",
+                    pages[run_start].ptr as u64
+                );
+            }
+            Ok(())
+        }
+
+        // ── Phase 3a: Linear scan with drain-before-scan ─────────────────
+        //
+        // Before each batch, drain the ring buffer so that BPF-captured
+        // pre-images are saved and marked in the bitmap.  The linear scan
+        // then skips those pages, eliminating double writes.  After saving
+        // each contiguous run of pages, wp_resolve is called immediately
+        // (per-run) instead of per-batch, minimising the window in which
+        // saved-but-still-WP pages can generate unnecessary BPF faults.
+        {
+            let mut batch_start = linear_cursor;
+            while linear_cursor < total_pages {
+                let batch_end = std::cmp::min(batch_start + LINEAR_BATCH, total_pages);
+
+                // Drain ring buffer BEFORE scanning this batch.
+                // Pre-images from BPF faults that fired before (or during the
+                // previous batch) are written to disk and marked in the bitmap
+                // so the linear scan below can skip them.
+                self.ring_consumer
+                    .for_each(|addr, data| {
+                        if let Some(idx) =
+                            addr_to_page_index(&self.slot_ranges, addr as usize, page_size)
+                        {
+                            let pg = &self.pages[idx];
+                            self.mem_file.write_all_at(data, pg.file_offset)?;
+                            if !bitmap_test(&self.saved_bitmap, idx) {
+                                bitmap_set(&mut self.saved_bitmap, idx);
+                                saved_count += 1;
+                            }
+                            ringbuf_pages_saved += 1;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
+
+                let drops = read_bpf_drop_counter(&self.bpf_obj);
+                if drops > 0 {
+                    return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
+                        "ring buffer dropped {drops} pre-image(s) during linear scan \
+                         (batch {batch_start}/{total_pages}) — snapshot is inconsistent",
+                    )));
+                }
+
+                // Linear scan this batch with per-run wp_resolve.
+                let mut run_start = linear_cursor;
+                let mut run_pages = 0usize;
+
+                while linear_cursor < batch_end {
+                    if bitmap_test(&self.saved_bitmap, linear_cursor) {
+                        // Already saved (by ring buffer drain above). Flush
+                        // the current run before skipping.
+                        if run_pages > 0 {
+                            flush_run(
+                                &self.mem_file,
+                                &self.pages,
+                                &self.links,
+                                run_start,
+                                run_pages,
+                                page_size,
+                            )?;
+                            run_pages = 0;
+                        }
+                        linear_cursor += 1;
+                        continue;
+                    }
+
+                    // Break the run if the next page is not contiguous.
+                    if run_pages > 0
+                        && self.pages[linear_cursor].ptr
+                            != unsafe { self.pages[run_start].ptr.add(run_pages * page_size) }
+                    {
+                        flush_run(
+                            &self.mem_file,
+                            &self.pages,
+                            &self.links,
+                            run_start,
+                            run_pages,
+                            page_size,
+                        )?;
+                        run_pages = 0;
+                    }
+
+                    if run_pages == 0 {
+                        run_start = linear_cursor;
+                    }
+                    bitmap_set(&mut self.saved_bitmap, linear_cursor);
+                    saved_count += 1;
+                    run_pages += 1;
+                    linear_cursor += 1;
+                }
+
+                // Flush the last run of this batch.
+                if run_pages > 0 {
+                    flush_run(
+                        &self.mem_file,
+                        &self.pages,
+                        &self.links,
+                        run_start,
+                        run_pages,
+                        page_size,
+                    )?;
+                }
+
+                batch_start = batch_end;
+            }
+        }
+
+        // ── Phase 3b: Final ring buffer drain ──────────────────────────────
+        loop {
+            let prev = saved_count;
+            self.ring_consumer
+                .for_each(|addr, data| {
+                    if let Some(idx) =
+                        addr_to_page_index(&self.slot_ranges, addr as usize, page_size)
+                    {
+                        let page = &self.pages[idx];
+                        self.mem_file.write_all_at(data, page.file_offset)?;
+                        if !bitmap_test(&self.saved_bitmap, idx) {
+                            bitmap_set(&mut self.saved_bitmap, idx);
+                            saved_count += 1;
+                        }
+                        ringbuf_pages_saved += 1;
+                    }
+                    Ok(())
+                })
+                .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
+
+            if saved_count >= total_pages {
+                break;
+            }
+            if saved_count > prev {
+                last_progress = Instant::now();
+            } else {
+                std::thread::yield_now();
+                if last_progress.elapsed() > STREAM_TIMEOUT {
+                    return Err(CreateSnapshotError::BpfLoad(format!(
+                        "Live-BPF streaming timeout: no progress for {}s \
+                         ({saved_count}/{total_pages} pages saved)",
+                        STREAM_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        }
+
+        // === Phase 4: FINALIZE (minus kick_devices — done by event manager) ===
+        let t_stream_total = t_stream_start.elapsed();
+
+        let drop_count = read_bpf_drop_counter(&self.bpf_obj);
+        if drop_count > 0 {
+            return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
+                "ring buffer dropped {drop_count} pre-image(s) during snapshot — \
+                 snapshot is inconsistent. Consider increasing ring buffer size \
+                 or reducing LINEAR_BATCH.",
+            )));
+        }
+
+        info!(
+            "Live-BPF snapshot: Phase 3 (stream) took {} us, {} pages total \
+             ({} ring-buffer, {} linear-scan, {} ring-drops)",
+            t_stream_total.as_micros(),
+            total_pages,
+            ringbuf_pages_saved,
+            total_pages - ringbuf_pages_saved,
+            drop_count,
+        );
+        info!("Live-BPF snapshot: Phase 4 - Finalize (worker)");
+        let t_finalize_start = Instant::now();
+
+        // Drop BPF links to remove write-protection.
+        self.links.clear();
+
+        snapshot_state_to_file(&self.microvm_state, &self.snapshot_path)?;
+
+        self.mem_file
+            .sync_all()
+            .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))?;
+
+        let t_total = self.t_start.elapsed();
+        let finalize_us = t_finalize_start.elapsed().as_micros();
+        info!("Live-BPF snapshot: Phase 4 (finalize) took {} us", finalize_us);
+        info!(
+            "Live-BPF snapshot: complete in {} us (freeze/downtime={} us)",
+            t_total.as_micros(),
+            self.t_freeze_total.as_micros(),
+        );
+
+        Ok(SnapshotTimings {
+            total_us: t_total.as_micros(),
+            freeze_us: self.t_freeze_total.as_micros(),
+            stream_us: t_stream_total.as_micros(),
+            finalize_us,
+            total_pages,
+            detail: format!(
+                "ring-buffer={}, linear-scan={}, ring-drops={}",
+                ringbuf_pages_saved,
+                total_pages - ringbuf_pages_saved,
+                drop_count
+            ),
+        })
+    }
+}
+
+// ── Main entry points ───────────────────────────────────────────────────────
+
+/// Result of Phase 1 BPF preparation (no Vmm lock required).
+pub(crate) struct Phase1BpfResult {
+    /// Pre-allocated memory backing file.
+    pub mem_file: File,
+    /// Total guest memory size in bytes.
+    pub total_mem_size: u64,
+    /// Loaded BPF object (struct_ops + ring buffer fds).
+    pub bpf_obj: BpfFaultObject,
+    /// Ring buffer size in bytes.
+    pub ring_buf_size: usize,
+}
+
+/// Phase 1: Prepare file and BPF object (VM still running, no Vmm lock needed).
 ///
-/// The VM is paused only briefly to save device/vCPU state and attach bpf_fault
-/// write-protection. Memory is then streamed to the output file while the VM
-/// continues running. Unlike the userfaultfd path, vCPUs are **never blocked**
-/// on a write fault.
-pub fn create_live_bpf_snapshot(
-    vmm: &mut Vmm,
+/// Computes total memory size, loads the BPF ELF (expensive verifier pass),
+/// creates the memory backing file, and pre-allocates its blocks.  Takes only
+/// `&Vm` (via `Arc<Vm>`) so it can run on the worker thread without holding
+/// the Vmm mutex.
+pub(crate) fn phase1_prepare_bpf(
+    vm: &crate::vstate::vm::Vm,
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
-) -> Result<(), CreateSnapshotError> {
-    // The BPF program hardcodes 4096-byte page pre-images; huge pages are not
-    // supported.
+) -> Result<Phase1BpfResult, CreateSnapshotError> {
     if vm_info.huge_pages.is_hugetlbfs() {
         return Err(CreateSnapshotError::BpfLoad(
             "LiveBpf snapshots do not support huge pages; the BPF program \
@@ -611,23 +964,10 @@ pub fn create_live_bpf_snapshot(
                 .to_string(),
         ));
     }
-    let page_size = vm_info.huge_pages.page_size();
-    let t_start = std::time::Instant::now();
 
-    // === Phase 1: PREPARE (VM still running) ===
     info!("Live-BPF snapshot: Phase 1 - Prepare");
 
-    let t_populate_start = std::time::Instant::now();
-    if let Some(h) = vmm.populate_pages_handle.take() {
-        h.join().expect("populate_pages background thread panicked");
-    }
-    info!(
-        "Live-BPF snapshot: populate_pages join took {} us",
-        t_populate_start.elapsed().as_micros()
-    );
-
-    let total_mem_size: u64 = vmm
-        .vm
+    let total_mem_size: u64 = vm
         .guest_memory()
         .iter()
         .flat_map(|region| region.slots())
@@ -653,22 +993,13 @@ pub fn create_live_bpf_snapshot(
         .set_len(total_mem_size)
         .map_err(|err| CreateSnapshotError::MemoryBackingFile("set_len", err))?;
 
-    // Pre-allocate the snapshot file's backing pages.  On tmpfs (the common
-    // case), pwrite() would otherwise allocate + zero a fresh page for every
-    // 4 KiB written, which shows up as ~42% of VMM-thread time in perf
-    // (shmem_alloc_and_add_folio + clear_page_rep).  fallocate() does this
-    // upfront in one batch, so the streaming pwrite() path becomes a simple
-    // memcpy into already-resident pages.
+    // Pre-allocate the snapshot file's backing pages.
     {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: mem_file is a valid open fd, and FALLOC_FL_KEEP_SIZE is a
-        // standard fallocate mode.
+        // SAFETY: mem_file is a valid open fd.
         let ret = unsafe {
             libc::fallocate(mem_file.as_raw_fd(), 0, 0, total_mem_size as libc::off_t)
         };
         if ret != 0 {
-            // Non-fatal: some filesystems don't support fallocate.
-            // The streaming path will still work, just slower.
             info!(
                 "Live-BPF snapshot: fallocate failed ({}), continuing without pre-alloc",
                 std::io::Error::last_os_error()
@@ -676,13 +1007,32 @@ pub fn create_live_bpf_snapshot(
         }
     }
 
+    Ok(Phase1BpfResult {
+        mem_file,
+        total_mem_size,
+        bpf_obj,
+        ring_buf_size,
+    })
+}
+
+/// Phase 2: Freeze VM, enable BPF WP, resume, and build the streaming task.
+///
+/// Requires `&mut Vmm` (caller holds the Vmm mutex).  The guard ensures the
+/// VM is resumed and devices kicked on error.
+pub(crate) fn phase2_freeze_bpf(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    phase1: Phase1BpfResult,
+    params: &CreateSnapshotParams,
+    t_start: Instant,
+) -> Result<BpfStreamingTask, CreateSnapshotError> {
+    let page_size = vm_info.huge_pages.page_size();
+
     let mut guard = BpfLiveSnapshotGuard::new(vmm);
 
     // === Phase 2: FREEZE (brief pause) ===
-    let t_phase1 = t_start.elapsed();
-    info!("Live-BPF snapshot: Phase 1 took {} us", t_phase1.as_micros());
     info!("Live-BPF snapshot: Phase 2 - Freeze");
-    let t_freeze_start = std::time::Instant::now();
+    let t_freeze_start = Instant::now();
 
     guard
         .vmm
@@ -698,15 +1048,6 @@ pub fn create_live_bpf_snapshot(
     let t_after_save_state = t_freeze_start.elapsed();
 
     // Attach bpf_fault to all plugged memory slots and enable WP.
-    // Build slot_ranges simultaneously — each entry records the link index,
-    // base address, and page range so we can map ring-buffer fault addresses
-    // to page indices and wp_resolve to the correct link fd.
-    struct SlotRange {
-        base_addr: usize,
-        page_count: usize,
-        page_index_start: usize,
-        link_index: usize,
-    }
     let mut slot_ranges: Vec<SlotRange> = Vec::new();
     let mut page_index = 0usize;
     {
@@ -717,7 +1058,7 @@ pub fn create_live_bpf_snapshot(
                 let len = slot.slice.len() as u64;
 
                 let link_fd = bpf_create_fault_link(
-                    bpf_obj.struct_ops_map_fd,
+                    phase1.bpf_obj.struct_ops_map_fd,
                     ptr,
                     len,
                     BPF_FAULT_FLAG_WP,
@@ -762,317 +1103,94 @@ pub fn create_live_bpf_snapshot(
         (t_freeze_total - t_after_wp).as_micros(),
     );
 
-    // === Phase 3: STREAM RAM (VM running, vCPUs never blocked) ===
-    info!("Live-BPF snapshot: Phase 3 - Stream RAM");
-    let t_stream_start = std::time::Instant::now();
-    let mut ringbuf_pages_saved = 0usize;
-
+    // Build the page table for streaming.
     let total_page_estimate: usize = slot_ranges.iter().map(|sr| sr.page_count).sum();
     let mut pages: Vec<PageEntry> = Vec::with_capacity(total_page_estimate);
     let mut file_offset: u64 = 0;
     let mut slot_range_cursor = 0usize;
-    let guest_memory = guard.vmm.vm.guest_memory();
-    for region in guest_memory.iter() {
-        for (slot, plugged) in region.slots() {
-            let slot_len = slot.slice.len();
-            if plugged {
-                let base_ptr = slot.slice.ptr_guard().as_ptr();
-                let sr = &slot_ranges[slot_range_cursor];
-                debug_assert_eq!(sr.base_addr, base_ptr as usize);
-                let link_index = sr.link_index;
-                slot_range_cursor += 1;
-                for off in (0..slot_len).step_by(page_size) {
-                    let actual_size = std::cmp::min(page_size, slot_len - off);
-                    pages.push(PageEntry {
-                        // SAFETY: base_ptr + off is within the guest memory slot.
-                        ptr: unsafe { base_ptr.add(off) },
-                        file_offset: file_offset + off as u64,
-                        size: actual_size,
-                        link_index,
-                    });
+    {
+        let guest_memory = guard.vmm.vm.guest_memory();
+        for region in guest_memory.iter() {
+            for (slot, plugged) in region.slots() {
+                let slot_len = slot.slice.len();
+                if plugged {
+                    let base_ptr = slot.slice.ptr_guard().as_ptr();
+                    let sr = &slot_ranges[slot_range_cursor];
+                    debug_assert_eq!(sr.base_addr, base_ptr as usize);
+                    let link_index = sr.link_index;
+                    slot_range_cursor += 1;
+                    for off in (0..slot_len).step_by(page_size) {
+                        let actual_size = std::cmp::min(page_size, slot_len - off);
+                        pages.push(PageEntry {
+                            // SAFETY: base_ptr + off is within the guest memory slot.
+                            ptr: unsafe { base_ptr.add(off) },
+                            file_offset: file_offset + off as u64,
+                            size: actual_size,
+                            link_index,
+                        });
+                    }
                 }
+                file_offset += slot_len as u64;
             }
-            file_offset += slot_len as u64;
         }
     }
 
     let total_pages = pages.len();
-    let mut saved_count = 0usize;
-    let mut linear_cursor = 0usize;
-
-    // Bitmap: one bit per page tracks whether it has been written to the
-    // snapshot file.  Both the ring-buffer and linear-scan paths check this
-    // before writing, so each page is written exactly once.
     let bitmap_words = (total_pages + 63) / 64;
-    let mut saved_bitmap = vec![0u64; bitmap_words];
+    let saved_bitmap = vec![0u64; bitmap_words];
 
-    #[inline(always)]
-    fn bitmap_test(bitmap: &[u64], idx: usize) -> bool {
-        bitmap[idx / 64] & (1u64 << (idx % 64)) != 0
-    }
-
-    #[inline(always)]
-    fn bitmap_set(bitmap: &mut [u64], idx: usize) {
-        bitmap[idx / 64] |= 1u64 << (idx % 64);
-    }
-
-    #[inline]
-    fn addr_to_page_index(
-        ranges: &[SlotRange],
-        addr: usize,
-        page_size: usize,
-    ) -> Option<usize> {
-        for r in ranges {
-            let end = r.base_addr + r.page_count * page_size;
-            if addr >= r.base_addr && addr < end {
-                return Some(r.page_index_start + (addr - r.base_addr) / page_size);
-            }
-        }
-        None
-    }
-
-    let mut ring_consumer = RingBufConsumer::new(bpf_obj.ring_buf_fd, ring_buf_size)
+    let ring_consumer = RingBufConsumer::new(phase1.bpf_obj.ring_buf_fd, phase1.ring_buf_size)
         .map_err(CreateSnapshotError::BpfRingBuf)?;
 
-    let mut last_progress = std::time::Instant::now();
-    const LINEAR_BATCH: usize = 4096;
+    // Extract links from guard — this consumes the guard and releases &mut Vmm.
+    let links = guard.into_streaming_state();
 
-    // The linear scan dominates: it reads each page, writes it to the
-    // snapshot file, and calls wp_resolve to clear write-protection.
-    // The ring buffer captures pre-images for pages the guest writes
-    // *before* the linear scan reaches them, but with a fast linear
-    // scan (fallocate + large batches), most pages are saved by the
-    // scan before the guest touches them.
-    //
-    // Key insight: ring buffer events fragment the linear scan's
-    // contiguous runs (bitmap-set pages break runs), causing many
-    // small wp_resolve calls and TLB shootdowns.  Instead, we run the
-    // linear scan over ALL pages regardless of bitmap state for the
-    // pwrite (skipping already-saved pages) while keeping wp_resolve
-    // contiguous across the full range.  Ring buffer drain happens
-    // only at the end for pages written after the linear scan passed.
-    //
-    // Phase 3a: Linear scan — write all pages, wp_resolve in big batches
-    // Phase 3b: Ring buffer drain — pick up pages written during 3a
+    let snapshot_path = params.snapshot_path.clone();
 
-    // ── Phase 3a: Linear scan ──────────────────────────────────────────
-    // Batch contiguous unsaved pages into single pwrite calls, just like
-    // the uffd path.  Without batching, the linear scan does ~524K
-    // individual 4 KiB pwrite syscalls; with batching, contiguous runs
-    // collapse into a handful of large writes.
-    {
-        let mut batch_start = linear_cursor;
-        while linear_cursor < total_pages {
-            // Accumulate a contiguous run of unsaved pages for a single pwrite.
-            let mut run_start = linear_cursor;
-            let mut run_pages = 0usize;
-
-            // Scan forward within this LINEAR_BATCH, building contiguous runs.
-            let batch_end = std::cmp::min(batch_start + LINEAR_BATCH, total_pages);
-            while linear_cursor < batch_end {
-                if bitmap_test(&saved_bitmap, linear_cursor) {
-                    // Already saved by ring buffer — flush any pending run.
-                    if run_pages > 0 {
-                        let run_len = run_pages * page_size;
-                        // SAFETY: pages within a run are contiguous in host memory.
-                        let data = unsafe {
-                            std::slice::from_raw_parts(pages[run_start].ptr, run_len)
-                        };
-                        mem_file
-                            .write_all_at(data, pages[run_start].file_offset)
-                            .map_err(|err| {
-                                CreateSnapshotError::MemoryBackingFile("write", err)
-                            })?;
-                        run_pages = 0;
-                    }
-                    linear_cursor += 1;
-                    continue;
-                }
-
-                // Check if this page extends the current run (contiguous in memory).
-                if run_pages > 0
-                    && pages[linear_cursor].ptr
-                        != unsafe { pages[run_start].ptr.add(run_pages * page_size) }
-                {
-                    // Not contiguous — flush the run.
-                    let run_len = run_pages * page_size;
-                    let data = unsafe {
-                        std::slice::from_raw_parts(pages[run_start].ptr, run_len)
-                    };
-                    mem_file
-                        .write_all_at(data, pages[run_start].file_offset)
-                        .map_err(|err| {
-                            CreateSnapshotError::MemoryBackingFile("write", err)
-                        })?;
-                    run_pages = 0;
-                }
-
-                if run_pages == 0 {
-                    run_start = linear_cursor;
-                }
-                bitmap_set(&mut saved_bitmap, linear_cursor);
-                saved_count += 1;
-                run_pages += 1;
-                linear_cursor += 1;
-            }
-
-            // Flush any trailing run in this batch.
-            if run_pages > 0 {
-                let run_len = run_pages * page_size;
-                let data = unsafe {
-                    std::slice::from_raw_parts(pages[run_start].ptr, run_len)
-                };
-                mem_file
-                    .write_all_at(data, pages[run_start].file_offset)
-                    .map_err(|err| {
-                        CreateSnapshotError::MemoryBackingFile("write", err)
-                    })?;
-            }
-
-            // wp_resolve the entire batch range in contiguous link ranges.
-            let mut wp_start = batch_start;
-            while wp_start < batch_end {
-                let link_idx = pages[wp_start].link_index;
-                let mut wp_end = wp_start + 1;
-                while wp_end < batch_end
-                    && pages[wp_end].link_index == link_idx
-                    && pages[wp_end].ptr
-                        == unsafe { pages[wp_start].ptr.add((wp_end - wp_start) * page_size) }
-                {
-                    wp_end += 1;
-                }
-                let range_len = (wp_end - wp_start) * page_size;
-                if let Err(err) = bpf_fault_wp_resolve(
-                    guard.links[link_idx].as_raw_fd(),
-                    pages[wp_start].ptr as u64,
-                    range_len as u64,
-                ) {
-                    warn!(
-                        "Live-BPF: wp_resolve failed at 0x{:x}: {err}",
-                        pages[wp_start].ptr as u64
-                    );
-                }
-                wp_start = wp_end;
-            }
-
-            batch_start = batch_end;
-
-            // Drain ring buffer between batches to prevent overflow.
-            // Always write the pre-image — it is the correct point-in-time
-            // content even if the linear scan already saved post-write data
-            // for this page.
-            ring_consumer
-                .for_each(|addr, data| {
-                    if let Some(idx) =
-                        addr_to_page_index(&slot_ranges, addr as usize, page_size)
-                    {
-                        let pg = &pages[idx];
-                        mem_file.write_all_at(data, pg.file_offset)?;
-                        if !bitmap_test(&saved_bitmap, idx) {
-                            bitmap_set(&mut saved_bitmap, idx);
-                            saved_count += 1;
-                        }
-                        ringbuf_pages_saved += 1;
-                    }
-                    Ok(())
-                })
-                .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
-
-            // Check for ring buffer overflow between batches so we fail
-            // early instead of completing a corrupted snapshot.
-            let drops = read_bpf_drop_counter(&bpf_obj);
-            if drops > 0 {
-                return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
-                    "ring buffer dropped {drops} pre-image(s) during linear scan \
-                     (batch {batch_start}/{total_pages}) — snapshot is inconsistent",
-                )));
-            }
-        }
-    }
-
-    // ── Phase 3b: Final ring buffer drain ──────────────────────────────
-    // Pick up any pages written by the guest after the linear scan
-    // passed them but before wp_resolve cleared their WP.
-    loop {
-        let prev = saved_count;
-        ring_consumer
-            .for_each(|addr, data| {
-                if let Some(idx) = addr_to_page_index(&slot_ranges, addr as usize, page_size) {
-                    let page = &pages[idx];
-                    mem_file.write_all_at(data, page.file_offset)?;
-                    if !bitmap_test(&saved_bitmap, idx) {
-                        bitmap_set(&mut saved_bitmap, idx);
-                        saved_count += 1;
-                    }
-                    ringbuf_pages_saved += 1;
-                }
-                Ok(())
-            })
-            .map_err(|err| CreateSnapshotError::MemoryBackingFile("write", err))?;
-
-        if saved_count >= total_pages {
-            break;
-        }
-        if saved_count > prev {
-            last_progress = std::time::Instant::now();
-        } else {
-            std::thread::yield_now();
-            if last_progress.elapsed() > STREAM_TIMEOUT {
-                return Err(CreateSnapshotError::BpfLoad(format!(
-                    "Live-BPF streaming timeout: no progress for {}s \
-                     ({saved_count}/{total_pages} pages saved)",
-                    STREAM_TIMEOUT.as_secs()
-                )));
-            }
-        }
-    }
-
-    // === Phase 4: FINALIZE ===
-    let t_stream_total = t_stream_start.elapsed();
-
-    // Check BPF drop counter: ring buffer overflows mean some pre-images
-    // were lost and those pages were saved with post-write content by the
-    // linear scan.  The snapshot is inconsistent and must not be used.
-    let drop_count = read_bpf_drop_counter(&bpf_obj);
-    if drop_count > 0 {
-        return Err(CreateSnapshotError::BpfRingBufOverflow(format!(
-            "ring buffer dropped {drop_count} pre-image(s) during snapshot — \
-             snapshot is inconsistent. Consider increasing ring buffer size \
-             or reducing LINEAR_BATCH.",
-        )));
-    }
-
-    info!(
-        "Live-BPF snapshot: Phase 3 (stream) took {} us, {} pages total \
-         ({} ring-buffer, {} linear-scan, {} ring-drops)",
-        t_stream_total.as_micros(),
+    Ok(BpfStreamingTask {
+        mem_file: phase1.mem_file,
+        pages,
+        saved_bitmap,
+        slot_ranges,
+        ring_consumer,
+        bpf_obj: phase1.bpf_obj,
+        links,
+        page_size,
         total_pages,
-        ringbuf_pages_saved,
-        total_pages - ringbuf_pages_saved,
-        drop_count,
-    );
-    info!("Live-BPF snapshot: Phase 4 - Finalize");
-    let t_finalize_start = std::time::Instant::now();
+        microvm_state,
+        snapshot_path,
+        t_start,
+        t_freeze_total,
+    })
+}
 
-    guard.vmm.kick_devices();
-    guard.devices_kicked = true;
-    guard.links.clear();
+/// Prepares a live BPF snapshot (Phase 1 + Phase 2) and returns a streaming
+/// task.  Used by the synchronous fallback path when no worker is available.
+pub(crate) fn prepare_live_bpf_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<BpfStreamingTask, CreateSnapshotError> {
+    let t_start = Instant::now();
+    let phase1 = phase1_prepare_bpf(&vmm.vm, vm_info, params)?;
+    let t_phase1 = t_start.elapsed();
+    info!("Live-BPF snapshot: Phase 1 took {} us", t_phase1.as_micros());
+    phase2_freeze_bpf(vmm, vm_info, phase1, params, t_start)
+}
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
-
-    mem_file
-        .sync_all()
-        .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))?;
-
-    let t_total = t_start.elapsed();
-    info!(
-        "Live-BPF snapshot: Phase 4 (finalize) took {} us",
-        t_finalize_start.elapsed().as_micros()
-    );
-    info!(
-        "Live-BPF snapshot: complete in {} us (freeze/downtime={} us)",
-        t_total.as_micros(),
-        t_freeze_total.as_micros(),
-    );
+/// Creates a live snapshot using the bpf_fault kernel interface (synchronous).
+///
+/// This is a convenience wrapper that calls [`prepare_live_bpf_snapshot`]
+/// followed by running the streaming task synchronously on the current thread.
+/// For background streaming (to keep device I/O alive), use
+/// `prepare_live_bpf_snapshot` and submit the task to the snapshot worker.
+pub fn create_live_bpf_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotParams,
+) -> Result<(), CreateSnapshotError> {
+    let task = prepare_live_bpf_snapshot(vmm, vm_info, params)?;
+    let _timings = Box::new(task).run()?;
+    vmm.kick_devices();
     Ok(())
 }
