@@ -151,6 +151,7 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     mem_path = Path(vm.chroot()) / "mem"
     row["mem_file_bytes"] = mem_path.stat().st_size if mem_path.exists() else 0
 
+    ts_rvm = None
     try:
         rvm, restore_timings = _do_restore_timed(microvm_factory, snapshot)
         row.update(restore_timings)
@@ -158,8 +159,19 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         rx_drop_after, _ = _get_iface_dropped(rvm)
         row["network_packets_dropped"] = rx_drop_after - rx_drop_before
 
-        # Stop the original sampler now — restore is done, the restored VM is up.
-        # CSV write is deferred until after the restored VM has been sampled.
+        # Start the restored-VM sampler immediately so it's already collecting
+        # while the original sampler drains its in-flight threads below.
+        # This eliminates the ~2.2s dead zone that would otherwise appear
+        # between the last failed sample and the first post-restore sample.
+        if ts_handle and _is_redis_workload(workload):
+            rvm_ip = rvm.iface["eth0"]["iface"].guest_ip
+            ts_rvm = _start_timeseries_sampler(
+                rvm_ip, workload, netns_id=rvm.netns.id,
+                start_wall=ts_handle["start_wall"],
+            )
+
+        # Stop the original sampler — its drain sleep now overlaps with ts_rvm
+        # collecting, so no measurement gap appears in the CSV.
         if ts_handle:
             _stop_timeseries_sampler(ts_handle)
     finally:
@@ -169,12 +181,7 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
 
     # Sample the restored VM so the timeline shows post-restore recovery.
     # Share start_wall with the original sampler for a continuous time axis.
-    if ts_handle and _is_redis_workload(workload):
-        rvm_ip = rvm.iface["eth0"]["iface"].guest_ip
-        ts_rvm = _start_timeseries_sampler(
-            rvm_ip, workload, netns_id=rvm.netns.id,
-            start_wall=ts_handle["start_wall"],
-        )
+    if ts_rvm is not None:
         time.sleep(10)   # ~100 post-restore samples
         _stop_timeseries_sampler(ts_rvm)
         ts_handle["samples"].extend(ts_rvm["samples"])
