@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Run the Firecracker snapshot experiment and export results to the bpf-fault bench repo.
+
+Phases:
+  1. Run pytest via devtool for each snapshot mode (unless --skip-run).
+  2. Copy timeseries CSVs into <bench-dir>/results/timeseries/.
+  3. Emit a bpf-fault-compatible JSON index to
+     <bench-dir>/results/snapshot_benchmark_<workload>.json.
+
+Usage:
+    # Full run (~2.5 h for 3 modes × 3 mem sizes × 3 iterations)
+    python3 run_snapshot_benchmark.py \\
+        --workload redis_light \\
+        --mem-sizes 2048 4096 8192 \\
+        --iterations 3 \\
+        --rootfs /srv/test_artifacts/ubuntu-24.04-app.ext4 \\
+        --bench-dir /mydata/bpf-fault/bench
+
+    # Re-export only (use existing test_results/, skip pytest)
+    python3 run_snapshot_benchmark.py \\
+        --workload redis_light \\
+        --bench-dir /mydata/bpf-fault/bench \\
+        --skip-run
+"""
+
+import argparse
+import csv
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------
+# Paths relative to this script's location (repo root / tests/...)
+# ---------------------------------------------------------------------------
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT   = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+_RESULTS_CSV = os.path.join(_REPO_ROOT, "test_results", "experiment_results.csv")
+_TS_DIR      = os.path.join(_REPO_ROOT, "test_results", "timeseries")
+_TEST_MODULE = "integration_tests/functional/test_snapshot_live_experiment.py"
+
+_MODE_TO_TEST = {
+    "live":     "test_live_snapshot_app_experiment",
+    "live_bpf": "test_live_bpf_snapshot_app_experiment",
+    "full":     "test_full_snapshot_app_experiment",
+}
+
+_DEFAULT_MEM_SIZES = [2048, 4096, 8192]
+_DEFAULT_ROOTFS    = "/srv/test_artifacts/ubuntu-24.04-app.ext4"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — run experiment
+# ---------------------------------------------------------------------------
+
+def run_experiment(workload: str, mem_sizes: list[int], iterations: int, rootfs: str):
+    """Run devtool test for each snapshot mode, filtering by workload."""
+    mem_filter = " or ".join(str(m) for m in mem_sizes)
+    env = {
+        **os.environ,
+        "EXPERIMENT_ROOTFS": rootfs,
+        "APP_ITERATIONS":    str(iterations),
+    }
+
+    for mode, test_fn in _MODE_TO_TEST.items():
+        k_filter = f"({test_fn}) and ({workload}) and ({mem_filter})"
+        cmd = [
+            "./tools/devtool", "-y", "test", "--",
+            "-k", k_filter,
+            _TEST_MODULE,
+            "-s", "--log-cli-level=INFO", "-m", "",
+        ]
+        print(f"\n{'='*70}")
+        print(f"Running mode={mode}  workload={workload}  mem={mem_sizes}")
+        print(f"  {' '.join(cmd)}")
+        print(f"{'='*70}")
+        subprocess.run(cmd, env=env, cwd=_REPO_ROOT, check=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2+3 — read CSV, copy timeseries, emit JSON
+# ---------------------------------------------------------------------------
+
+def _flt(val, default=0.0):
+    """Parse a CSV field to float, returning default on empty/None."""
+    try:
+        return float(val) if val not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _int_or(val, default=0):
+    try:
+        return int(val) if val not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
+
+
+def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
+                   max_iteration: int = 2):
+    """Read experiment_results.csv, copy CSVs, write JSON."""
+    results_dir = os.path.join(bench_dir, "results")
+    ts_dest_dir = os.path.join(results_dir, "timeseries")
+    os.makedirs(ts_dest_dir, exist_ok=True)
+
+    if not os.path.exists(_RESULTS_CSV):
+        print(f"ERROR: {_RESULTS_CSV} not found — run the experiment first.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(_RESULTS_CSV, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    # Deduplicate: keep only the most recent row per (mode, mem_size, iteration).
+    # The CSV accumulates across runs; sort by timestamp descending and take the
+    # first occurrence of each key.
+    seen: dict[tuple, dict] = {}
+    for row in sorted(rows, key=lambda r: r.get("timestamp", ""), reverse=True):
+        if row.get("workload") != workload:
+            continue
+        try:
+            mem = int(row["mem_size_mib"])
+        except (ValueError, KeyError):
+            continue
+        if mem not in mem_sizes:
+            continue
+        mode      = row.get("snapshot_mode", "")
+        iteration = _int_or(row.get("iteration", "0"))
+        if iteration > max_iteration:
+            continue
+        key = (mode, mem, iteration)
+        if key not in seen:
+            seen[key] = row
+
+    records = []
+    for row in seen.values():
+        mode      = row.get("snapshot_mode", "")
+        mem       = int(row["mem_size_mib"])
+        iteration = _int_or(row.get("iteration", "0"))
+
+        # ── timing ──────────────────────────────────────────────────────
+        if mode == "full":
+            total_ms   = _flt(row.get("full_total_ms"))
+            downtime_ms = total_ms
+            phases = {
+                "create": total_ms * 1000,   # µs for consistency with live phases
+            }
+        else:
+            total_ms    = _flt(row.get("total_us")) / 1000.0
+            downtime_ms = _flt(row.get("freeze_us")) / 1000.0
+            phases = {
+                "phase1":         _flt(row.get("phase1_us")),
+                "populate_pages": _flt(row.get("populate_pages_us")),
+                "freeze":         _flt(row.get("freeze_us")),
+                "stream":         _flt(row.get("stream_us")),
+                "finalize":       _flt(row.get("finalize_us")),
+            }
+
+        # ── throughput / latency ─────────────────────────────────────────
+        is_stream = workload == "stream"
+        if is_stream:
+            throughput = {
+                "baseline_triad_mibs": _flt(row.get("stream_baseline_triad_mibs")),
+                "during_triad_mibs":   _flt(row.get("stream_during_triad_mibs")),
+                "post_triad_mibs":     _flt(row.get("stream_post_triad_mibs")),
+                "baseline_copy_mibs":  _flt(row.get("stream_baseline_copy_mibs")),
+                "during_copy_mibs":    _flt(row.get("stream_during_copy_mibs")),
+            }
+            latency_us = {}
+            overall = {}
+        else:
+            throughput = {
+                "baseline_ops_s": _flt(row.get("app_baseline_ops")),
+                "during_ops_s":   _flt(row.get("app_during_ops")),
+                "post_ops_s":     _flt(row.get("post_snap_ops")),
+            }
+            latency_us = {
+                "baseline_avg": _flt(row.get("app_baseline_avg_us")),
+                "baseline_p99": _flt(row.get("app_baseline_p99_us")),
+                "during_avg":   _flt(row.get("app_during_avg_us")),
+                "during_p99":   _flt(row.get("app_during_p99_us")),
+                "post_avg":     _flt(row.get("post_snap_avg_us")),
+                "post_p99":     _flt(row.get("post_snap_p99_us")),
+            }
+            overall = {
+                "ops_mean":       _flt(row.get("overall_ops_mean")),
+                "ops_stddev":     _flt(row.get("overall_ops_stddev")),
+                "avg_latency_us": _flt(row.get("overall_avg_latency_us_mean")),
+                "p99_us_mean":    _flt(row.get("overall_p99_us_mean")),
+                "p99_us_stddev":  _flt(row.get("overall_p99_us_stddev")),
+            }
+
+        # ── timeseries CSV ───────────────────────────────────────────────
+        ts_rel  = row.get("timeseries_file", "")       # e.g. "timeseries/foo.csv"
+        ts_dest = ""
+        if ts_rel:
+            src = os.path.join(_REPO_ROOT, "test_results", ts_rel)
+            if os.path.exists(src):
+                basename = os.path.basename(src)
+                dst = os.path.join(ts_dest_dir, basename)
+                shutil.copy2(src, dst)
+                # relative path within bench results dir
+                ts_dest = f"timeseries/{basename}"
+            else:
+                print(f"  WARNING: timeseries not found: {src}", file=sys.stderr)
+
+        record = {
+            "config": {
+                "name":        "firecracker_snapshot",
+                "workload":    workload,
+                "mem_size_mib": mem,
+                "mode":        mode,
+                "iteration":   iteration,
+            },
+            "results": {
+                "total_snapshot_ms":  round(total_ms,    3),
+                "downtime_ms":        round(downtime_ms, 3),
+                "phase_breakdown_us": {k: round(v, 1) for k, v in phases.items()},
+                "throughput":         {k: round(v, 3) for k, v in throughput.items()},
+                "latency_us":         {k: round(v, 3) for k, v in latency_us.items()},
+                "overall":            {k: round(v, 3) for k, v in overall.items()},
+                "timeseries_file":    ts_dest,
+                "ts_snap_start_s":    _flt(row.get("ts_snap_start_s")),
+                "ts_snap_end_s":      _flt(row.get("ts_snap_end_s")),
+                "ts_freeze_start_s":  _flt(row.get("ts_freeze_start_s")),
+                "ts_freeze_end_s":    _flt(row.get("ts_freeze_end_s")),
+            },
+        }
+        records.append(record)
+
+    records.sort(key=lambda r: (
+        r["config"]["mode"],
+        r["config"]["mem_size_mib"],
+        r["config"]["iteration"],
+    ))
+
+    out_path = os.path.join(results_dir, f"snapshot_benchmark_{workload}.json")
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(records, f, indent=4)
+    os.rename(tmp_path, out_path)
+
+    print(f"\nExported {len(records)} records → {out_path}")
+    print(f"Timeseries CSVs copied → {ts_dest_dir}")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Run Firecracker snapshot benchmark and export to bpf-fault bench repo.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--workload",    default="redis_light",
+                    help="Workload name to filter (e.g. redis_light, redis_heavy)")
+    ap.add_argument("--mem-sizes",   type=int, nargs="+", default=_DEFAULT_MEM_SIZES,
+                    metavar="MiB",   help="VM memory sizes to include")
+    ap.add_argument("--iterations",  type=int, default=3,
+                    help="Number of iterations per configuration")
+    ap.add_argument("--rootfs",      default=_DEFAULT_ROOTFS,
+                    help="Path to guest rootfs image")
+    ap.add_argument("--bench-dir",   default="/mydata/bpf-fault/bench",
+                    help="Path to bpf-fault bench directory")
+    ap.add_argument("--skip-run",      action="store_true",
+                    help="Skip pytest; re-export from existing test_results/")
+    ap.add_argument("--max-iteration", type=int, default=2,
+                    help="Only include iterations 0..N (inclusive)")
+    args = ap.parse_args()
+
+    if not args.skip_run:
+        run_experiment(args.workload, args.mem_sizes, args.iterations, args.rootfs)
+
+    export_results(args.workload, args.mem_sizes, args.bench_dir,
+                   max_iteration=args.max_iteration)
+
+
+if __name__ == "__main__":
+    main()
