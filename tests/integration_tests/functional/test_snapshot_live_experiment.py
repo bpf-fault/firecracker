@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from .experiment import (
+    APP_ITERATIONS,
     APP_MEM_SIZES,
     MEMORY_FILL_FRACTION,
     VCPU_COUNT,
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("mem_size_mib", [256, 512, 1024, 2048, 4096])
 @pytest.mark.parametrize("workload", ["idle", "light", "medium", "heavy"])
-@pytest.mark.parametrize("iteration", range(10))
+@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
 def test_full_snapshot_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
@@ -71,7 +72,7 @@ def test_full_snapshot_experiment(
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("mem_size_mib", [256, 512, 1024, 2048, 4096])
 @pytest.mark.parametrize("workload", ["idle", "light", "medium", "heavy"])
-@pytest.mark.parametrize("iteration", range(10))
+@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
 def test_live_snapshot_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
@@ -95,7 +96,7 @@ def test_live_snapshot_experiment(
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("mem_size_mib", [256, 512, 1024, 2048, 4096])
 @pytest.mark.parametrize("workload", ["idle", "light", "medium", "heavy"])
-@pytest.mark.parametrize("iteration", range(10))
+@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
 def test_live_bpf_snapshot_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
@@ -258,7 +259,7 @@ def test_snapshot_experiment_quick(
     "redis_light", "redis_mixed", "redis_heavy",
     "memcached_light", "memcached_heavy", "stream",
 ])
-@pytest.mark.parametrize("iteration", range(10))
+@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
 def test_full_snapshot_app_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
@@ -280,7 +281,7 @@ def test_full_snapshot_app_experiment(
     "redis_light", "redis_mixed", "redis_heavy",
     "memcached_light", "memcached_heavy", "stream",
 ])
-@pytest.mark.parametrize("iteration", range(10))
+@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
 def test_live_snapshot_app_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
@@ -299,12 +300,22 @@ def test_live_snapshot_app_experiment(
 @pytest.mark.nonci
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
-@pytest.mark.parametrize("workload", ["redis_light", "redis_mixed", "redis_heavy"])
-@pytest.mark.parametrize("iteration", range(10))
+@pytest.mark.parametrize(
+    "workload",
+    [
+        "redis_light",
+        "redis_mixed",
+        "redis_heavy",
+        "memcached_light",
+        "memcached_heavy",
+        "stream",
+    ],
+)
+@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
 def test_live_bpf_snapshot_app_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
-    """Collect live-bpf-snapshot metrics under Redis workload."""
+    """Collect live-bpf-snapshot metrics under Redis, Memcached, and STREAM workloads."""
     vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib, bpf=True)
     _check_workload_tools(vm, workload)
     row = _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)

@@ -28,6 +28,8 @@ WORKLOAD_PARAMS = {
 # Application workload experiment — reduced matrix per design doc §6.2
 APP_MEM_SIZES = [2048, 4096, 8192]
 
+APP_ITERATIONS = int(os.environ.get("APP_ITERATIONS", "10"))
+
 REDIS_WORKLOAD_PARAMS = {
     # value_size=128 and pipeline=1 match the QEMU benchmark defaults
     # (--benchmark-value-size 128, --benchmark-pipeline 1) for cross-hypervisor

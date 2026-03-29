@@ -348,6 +348,8 @@ run_devctr() {
         --tmpfs /srv:exec,dev,size=32G \
         -v /boot:/boot \
         --env PYTHONDONTWRITEBYTECODE=1 \
+        ${EXPERIMENT_ROOTFS:+--env EXPERIMENT_ROOTFS="$EXPERIMENT_ROOTFS"} \
+        ${APP_ITERATIONS:+--env APP_ITERATIONS="$APP_ITERATIONS"} \
         $([ -x /usr/local/bin/memtier_benchmark ] && echo "--volume /usr/local/bin/memtier_benchmark:/usr/local/bin/memtier_benchmark:ro --volume /lib/x86_64-linux-gnu/libevent-2.1.so.7:/lib/x86_64-linux-gnu/libevent-2.1.so.7:ro --volume /lib/x86_64-linux-gnu/libevent_openssl-2.1.so.7:/lib/x86_64-linux-gnu/libevent_openssl-2.1.so.7:ro") \
         "$DEVCTR_IMAGE" "${ctr_args[@]}"
 }
