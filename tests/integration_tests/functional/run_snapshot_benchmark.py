@@ -98,6 +98,74 @@ def _int_or(val, default=0):
         return default
 
 
+def _compute_window_stats(ts_path, t_start, t_end):
+    """Compute throughput/latency stats for non-failed samples in [t_start, t_end].
+
+    Reads the timeseries CSV produced by the experiment and aggregates samples
+    whose ``t_rel_s`` falls within the requested window.  Latency values in the
+    CSV are in milliseconds; the returned dict converts them to microseconds for
+    consistency with the rest of the JSON.
+
+    Returns all-zeros (sample_count=0) when the file is missing, the window
+    contains no non-failed samples (e.g. full-snapshot VM pause), or the
+    time range is invalid.
+
+    Sanity invariant: ``max_avg_latency_us`` should be ≥ the freeze duration
+    for any request that was in-flight during the pause.
+    """
+    empty = {
+        "throughput_ops_s":   0.0,
+        "avg_latency_us":     0.0,
+        "p99_us":             0.0,
+        "p999_us":            0.0,
+        "max_avg_latency_us": 0.0,
+        "max_p999_us":        0.0,
+        "sample_count":       0,
+    }
+    if not ts_path or not os.path.exists(ts_path) or t_end <= t_start:
+        return empty
+
+    rows = []
+    try:
+        with open(ts_path, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    t = float(row["t_rel_s"])
+                    if t < t_start or t > t_end:
+                        continue
+                    if int(row.get("failed", "0") or 0):
+                        continue
+                    rows.append({
+                        "thr":  float(row["throughput"]),
+                        "avg":  float(row.get("avg_ms",  0) or 0),
+                        "p99":  float(row.get("p99_ms",  0) or 0),
+                        "p999": float(row.get("p999_ms", 0) or 0),
+                    })
+                except (KeyError, ValueError):
+                    pass
+    except OSError:
+        return empty
+
+    if not rows:
+        return empty
+
+    thr  = [r["thr"]  for r in rows]
+    avg  = [r["avg"]  for r in rows]
+    p99  = [r["p99"]  for r in rows]
+    p999 = [r["p999"] for r in rows]
+    n    = len(rows)
+
+    return {
+        "throughput_ops_s":   sum(thr)  / n,
+        "avg_latency_us":     sum(avg)  / n * 1000,
+        "p99_us":             sum(p99)  / n * 1000,
+        "p999_us":            sum(p999) / n * 1000,
+        "max_avg_latency_us": max(avg)      * 1000,
+        "max_p999_us":        max(p999)     * 1000,
+        "sample_count":       n,
+    }
+
+
 def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
                    max_iteration: int = 2):
     """Read experiment_results.csv, copy CSVs, write JSON."""
@@ -176,12 +244,13 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
                 "post_ops_s":     _flt(row.get("post_snap_ops")),
             }
             latency_us = {
-                "baseline_avg": _flt(row.get("app_baseline_avg_us")),
-                "baseline_p99": _flt(row.get("app_baseline_p99_us")),
-                "during_avg":   _flt(row.get("app_during_avg_us")),
-                "during_p99":   _flt(row.get("app_during_p99_us")),
-                "post_avg":     _flt(row.get("post_snap_avg_us")),
-                "post_p99":     _flt(row.get("post_snap_p99_us")),
+                "baseline_avg":  _flt(row.get("app_baseline_avg_us")),
+                "baseline_p99":  _flt(row.get("app_baseline_p99_us")),
+                "during_avg":    _flt(row.get("app_during_avg_us")),
+                "during_p99":    _flt(row.get("app_during_p99_us")),
+                "during_p999":   _flt(row.get("app_during_p999_us")),
+                "post_avg":      _flt(row.get("post_snap_avg_us")),
+                "post_p99":      _flt(row.get("post_snap_p99_us")),
             }
             overall = {
                 "ops_mean":       _flt(row.get("overall_ops_mean")),
@@ -193,10 +262,12 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
 
         # ── timeseries CSV ───────────────────────────────────────────────
         ts_rel  = row.get("timeseries_file", "")       # e.g. "timeseries/foo.csv"
+        ts_src  = ""   # absolute path to source CSV (for window stats)
         ts_dest = ""
         if ts_rel:
             src = os.path.join(_REPO_ROOT, "test_results", ts_rel)
             if os.path.exists(src):
+                ts_src = src
                 basename = os.path.basename(src)
                 dst = os.path.join(ts_dest_dir, basename)
                 shutil.copy2(src, dst)
@@ -204,6 +275,11 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
                 ts_dest = f"timeseries/{basename}"
             else:
                 print(f"  WARNING: timeseries not found: {src}", file=sys.stderr)
+
+        # ── freeze-window stats (phases 2-4, after prepare) ─────────────
+        ts_freeze_start = _flt(row.get("ts_freeze_start_s"))
+        ts_snap_end     = _flt(row.get("ts_snap_end_s"))
+        freeze_window   = _compute_window_stats(ts_src, ts_freeze_start, ts_snap_end)
 
         record = {
             "config": {
@@ -220,6 +296,10 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
                 "throughput":         {k: round(v, 3) for k, v in throughput.items()},
                 "latency_us":         {k: round(v, 3) for k, v in latency_us.items()},
                 "overall":            {k: round(v, 3) for k, v in overall.items()},
+                "freeze_window":      {
+                    k: (int(v) if k == "sample_count" else round(v, 3))
+                    for k, v in freeze_window.items()
+                },
                 "timeseries_file":    ts_dest,
                 "ts_snap_start_s":    _flt(row.get("ts_snap_start_s")),
                 "ts_snap_end_s":      _flt(row.get("ts_snap_end_s")),
