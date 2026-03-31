@@ -407,6 +407,9 @@ def microvm_factory(request, record_property, results_dir, netns_factory):
                 src = uvm_root / item
                 if not os.path.isfile(src):
                     continue
+                # Skip large binary blobs (rootfs images, kernels) to avoid filling disk
+                if os.path.getsize(src) > 100 * 1024 * 1024:
+                    continue
                 dst = uvm_data / item
                 shutil.copy(src, dst)
 

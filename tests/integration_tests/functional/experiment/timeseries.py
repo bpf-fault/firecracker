@@ -27,6 +27,7 @@ import threading
 import time
 
 from .constants import (
+    MEMCACHED_WORKLOAD_PARAMS,
     REDIS_WORKLOAD_PARAMS,
     TIMESERIES_BACKEND,
     TIMESERIES_DIR,
@@ -176,6 +177,98 @@ def _redis_workload_burst(host, n_ops, timeout, op, value_size, port=6379, netns
         return _fail
 
 
+def _build_memcached_cmd(op, value_size):
+    """Build a pipelineable memcached text-protocol command for a single SET or GET op.
+
+    Uses a fixed key ``ts:k``.
+    SET response sentinel: ``STORED\\r\\n``
+    GET response sentinel: ``END\\r\\n``
+    """
+    key = b"ts:k"
+    if op == "set":
+        val = b"x" * value_size
+        cmd = (
+            b"set " + key + b" 0 0 " + str(len(val)).encode() + b"\r\n"
+            + val + b"\r\n"
+        )
+    else:
+        cmd = b"get " + key + b"\r\n"
+    return cmd
+
+
+def _memcached_workload_burst(host, n_ops, timeout, op, value_size, port=11211, netns_id=None):
+    """Pipeline n_ops SET or GET commands to memcached and measure per-op latency.
+
+    Identical structure to ``_redis_workload_burst``: sequential phase for latency,
+    pipelined phase for throughput.  Uses the memcached text protocol.
+
+    Returns (ops_per_sec, avg_ms, p50_ms, p99_ms, p999_ms, failed).
+    ``failed`` is True when a connection error or timeout occurs.
+    """
+    cmd = _build_memcached_cmd(op, value_size)
+    burst_cmd = cmd * n_ops
+    sentinel = b"STORED\r\n" if op == "set" else b"END\r\n"
+    netns_fd = self_fd = None
+    _fail = (0.0, timeout * 1000, timeout * 1000, timeout * 1000, timeout * 1000, True)
+    try:
+        if netns_id:
+            netns_fd = os.open(f"/var/run/netns/{netns_id}", os.O_RDONLY)
+            self_fd  = os.open("/proc/self/ns/net",           os.O_RDONLY)
+        try:
+            if netns_id:
+                os.setns(netns_fd, CLONE_NEWNET)
+            with socket.create_connection((host, port), timeout=timeout) as s:
+                s.settimeout(timeout)
+                # Phase 1: sequential ops for latency.
+                latencies = []
+                for _ in range(_TS_LAT_OPS):
+                    t0 = time.monotonic()
+                    s.sendall(cmd)
+                    buf = b""
+                    while sentinel not in buf:
+                        chunk = s.recv(256)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    latencies.append((time.monotonic() - t0) * 1000)
+                # Phase 2: pipelined burst for throughput.
+                t0 = time.monotonic()
+                s.sendall(burst_cmd)
+                buf = b""
+                count = 0
+                while count < n_ops:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    count = buf.count(sentinel)
+                elapsed = time.monotonic() - t0
+        finally:
+            if netns_id:
+                os.setns(self_fd, CLONE_NEWNET)
+                os.close(netns_fd)
+                os.close(self_fd)
+        if not latencies or elapsed <= 0:
+            return _fail
+        ops_per_sec = n_ops / elapsed
+        sorted_lats = sorted(latencies)
+        avg_ms = sum(latencies) / len(latencies)
+        p50  = _percentile(sorted_lats, 50)
+        p99  = _percentile(sorted_lats, 99)
+        p999 = _percentile(sorted_lats, 99.9)
+        return ops_per_sec, avg_ms, p50, p99, p999, False
+    except Exception as _exc:  # noqa: BLE001
+        if not getattr(_memcached_workload_burst, "_logged", False):
+            import sys as _sys
+            import traceback as _tb
+            print(
+                f"[ts-memcached] burst failed: {_exc!r}\n{_tb.format_exc()}",
+                flush=True, file=_sys.stderr,
+            )
+            _memcached_workload_burst._logged = True  # type: ignore[attr-defined]
+        return _fail
+
+
 # ---------------------------------------------------------------------------
 # TCP backend
 # ---------------------------------------------------------------------------
@@ -186,32 +279,46 @@ class _noop_lock:  # noqa: N801
     def __exit__(self, *_): pass
 
 def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None):
-    """Start a daemon thread that samples Redis throughput at TIMESERIES_INTERVAL_S cadence.
+    """Start a daemon thread that samples workload throughput at TIMESERIES_INTERVAL_S cadence.
 
-    Connects to the guest Redis over its TAP IP using raw TCP RESP, so
-    connection failures during VM pause/freeze appear as failed samples.
-    Slow responses (up to TIMESERIES_TIMEOUT_S) are recorded as real high-latency
-    data points rather than being clipped to "failed".
+    Connects to the guest service over its TAP IP using raw TCP, so connection
+    failures during VM pause/freeze appear as failed samples.  Slow responses
+    (up to TIMESERIES_TIMEOUT_S) are recorded as real high-latency data points
+    rather than being clipped to "failed".
 
-    The sampler uses the same operation type (SET or GET) and value size as the
-    active workload, matching how the QEMU benchmark derives its per-second
-    timeseries directly from workload traffic.  This ensures write-protect
-    faults triggered by SET operations appear as latency spikes rather than
-    being masked by PING's trivial memory footprint.
+    For Redis workloads: uses RESP on port 6379.
+    For Memcached workloads: uses the text protocol on port 11211.
+
+    SET operations are preferred so that write-protect faults triggered by the
+    live snapshot appear as latency spikes rather than being masked.
 
     ``start_wall`` lets a second sampler share the same time origin as the
     first (pass ``handle["start_wall"]`` from the original sampler).  When
     omitted a new origin is established at call time.
 
     Returns a handle dict for use with _stop_timeseries_sampler / _write_timeseries_csv.
-    Only call for redis workloads.
+    Supports both Redis (RESP, port 6379) and Memcached (text protocol, port 11211).
     """
-    # Determine the operation and value size from the workload params.  For
-    # mixed workloads (set,get) use SET so that write-protect faults show up.
-    params = REDIS_WORKLOAD_PARAMS.get(workload, {})
-    ops_str = params.get("ops", "get")
-    op = "set" if "set" in ops_str else "get"
-    value_size = params.get("value_size", 128)
+    # Choose burst function and parameters based on workload type.
+    # Always prefer SET operations so that write-protect faults triggered by the
+    # live snapshot appear as latency spikes rather than being masked.
+    if workload in MEMCACHED_WORKLOAD_PARAMS:
+        def _burst(host):
+            return _memcached_workload_burst(
+                host, TIMESERIES_SAMPLE_OPS, timeout=TIMESERIES_TIMEOUT_S,
+                op="set", value_size=32, port=11211, netns_id=netns_id,
+            )
+    else:
+        params = REDIS_WORKLOAD_PARAMS.get(workload, {})
+        ops_str = params.get("ops", "get")
+        op = "set" if "set" in ops_str else "get"
+        value_size = params.get("value_size", 128)
+
+        def _burst(host):
+            return _redis_workload_burst(
+                host, TIMESERIES_SAMPLE_OPS, timeout=TIMESERIES_TIMEOUT_S,
+                op=op, value_size=value_size, netns_id=netns_id,
+            )
 
     samples = []          # [(t_rel_s, ops_per_sec, avg_ms, p50_ms, p99_ms, p999_ms, failed)]
     samples_lock = threading.Lock()
@@ -220,10 +327,7 @@ def _start_timeseries_sampler(guest_ip, workload, netns_id=None, start_wall=None
 
     def _fire(t_rel):
         """Issue one burst and append the result stamped at issue time."""
-        ops, avg_ms, p50, p99, p999, failed = _redis_workload_burst(
-            guest_ip, TIMESERIES_SAMPLE_OPS, timeout=TIMESERIES_TIMEOUT_S,
-            op=op, value_size=value_size, netns_id=netns_id,
-        )
+        ops, avg_ms, p50, p99, p999, failed = _burst(guest_ip)
         entry = (
             round(t_rel, 3), ops,
             round(avg_ms, 3), round(p50, 3), round(p99, 3), round(p999, 3),

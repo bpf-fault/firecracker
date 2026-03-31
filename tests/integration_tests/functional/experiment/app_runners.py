@@ -92,11 +92,11 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     pid = vm.firecracker_pid
     row["rss_pre_kib"] = _get_rss_kib(pid)
 
-    # Start timeseries sampler BEFORE full snapshot (only for redis workloads).
+    # Start timeseries sampler BEFORE full snapshot (redis and memcached workloads).
     # During the snapshot the VM is paused, so all sampler hits will fail →
     # the resulting CSV shows flat baseline → drop to 0 → still zero (paused).
     ts_handle = None
-    if _is_redis_workload(workload):
+    if _is_redis_workload(workload) or _is_memcached_workload(workload):
         guest_ip = vm.iface["eth0"]["iface"].guest_ip
         # Full snapshot: always use the TCP backend.  The VM is completely paused
         # so the sampler records unambiguous failed samples during the pause, then
@@ -163,7 +163,7 @@ def _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         # while the original sampler drains its in-flight threads below.
         # This eliminates the ~2.2s dead zone that would otherwise appear
         # between the last failed sample and the first post-restore sample.
-        if ts_handle and _is_redis_workload(workload):
+        if ts_handle and (_is_redis_workload(workload) or _is_memcached_workload(workload)):
             rvm_ip = rvm.iface["eth0"]["iface"].guest_ip
             ts_rvm = _start_timeseries_sampler(
                 rvm_ip, workload, netns_id=rvm.netns.id,
@@ -304,15 +304,16 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
     pid = vm.firecracker_pid
     row["rss_pre_kib"] = _get_rss_kib(pid)
 
-    # Start timeseries sampler for redis workloads (used by plot 16).
+    # Start timeseries sampler for redis and memcached workloads (used by plot 16).
     # We sleep briefly before and after the snapshot so the sampler captures
     # pre-snapshot baseline samples and post-snapshot streaming-phase samples.
     # The sampler is stopped before collecting during results so it doesn't
     # contend with _collect_redis_during_results waiting on the subprocess.
+    # Memcached always uses the TCP backend (memtier backend is Redis-only).
     ts_handle = None
-    if _is_redis_workload(workload):
+    if _is_redis_workload(workload) or _is_memcached_workload(workload):
         guest_ip = vm.iface["eth0"]["iface"].guest_ip
-        if TIMESERIES_BACKEND == "memtier":
+        if TIMESERIES_BACKEND == "memtier" and _is_redis_workload(workload):
             ts_handle = _start_timeseries_memtier(guest_ip, vm.netns.id, workload)
         else:
             ts_handle = _start_timeseries_sampler(guest_ip, workload, netns_id=vm.netns.id)
@@ -353,11 +354,11 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         try:
             time.sleep(10)
         finally:
-            if TIMESERIES_BACKEND == "memtier":
+            if TIMESERIES_BACKEND == "memtier" and _is_redis_workload(workload):
                 _stop_timeseries_memtier(ts_handle)
             else:
                 _stop_timeseries_sampler(ts_handle)
-        if TIMESERIES_BACKEND == "memtier":
+        if TIMESERIES_BACKEND == "memtier" and _is_redis_workload(workload):
             ts_name = _write_timeseries_csv_from_memtier(ts_handle, workload, mem_size_mib, "live", iteration)
             row["timeseries_file"] = ts_name
             row["timeseries_failed_samples"] = 0
@@ -573,9 +574,9 @@ def _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iter
     row["rss_pre_kib"] = _get_rss_kib(pid)
 
     ts_handle = None
-    if _is_redis_workload(workload):
+    if _is_redis_workload(workload) or _is_memcached_workload(workload):
         guest_ip = vm.iface["eth0"]["iface"].guest_ip
-        if TIMESERIES_BACKEND == "memtier":
+        if TIMESERIES_BACKEND == "memtier" and _is_redis_workload(workload):
             ts_handle = _start_timeseries_memtier(guest_ip, vm.netns.id, workload)
         else:
             ts_handle = _start_timeseries_sampler(guest_ip, workload, netns_id=vm.netns.id)
@@ -614,11 +615,11 @@ def _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iter
         try:
             time.sleep(10)
         finally:
-            if TIMESERIES_BACKEND == "memtier":
+            if TIMESERIES_BACKEND == "memtier" and _is_redis_workload(workload):
                 _stop_timeseries_memtier(ts_handle)
             else:
                 _stop_timeseries_sampler(ts_handle)
-        if TIMESERIES_BACKEND == "memtier":
+        if TIMESERIES_BACKEND == "memtier" and _is_redis_workload(workload):
             ts_name = _write_timeseries_csv_from_memtier(ts_handle, workload, mem_size_mib, "live_bpf", iteration)
             row["timeseries_file"] = ts_name
             row["timeseries_failed_samples"] = 0

@@ -13,6 +13,7 @@ See docs/live_snapshot/live-snapshot-experiment-design.md for full design.
 
 import logging
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,8 @@ from .experiment import (
     _run_live_snapshot_app,
     _write_csv_row,
 )
+from .experiment.timeseries import _start_timeseries_sampler, _stop_timeseries_sampler
+from .experiment.workloads.memcached import _setup_memcached
 
 logger = logging.getLogger(__name__)
 
@@ -323,3 +326,44 @@ def test_live_bpf_snapshot_app_experiment(
     record_property("throughput_mibs", row.get("throughput_mibs", 0))
     _write_csv_row(row)
     _log_app_summary(row)
+
+
+# ---------------------------------------------------------------------------
+# Quick verification test: memcached timeseries sampler connectivity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.nonci
+@pytest.mark.timeout(120)
+def test_memcached_timeseries_quick(uvm_plain, microvm_factory):
+    """Smoke test: verify the host-side TCP timeseries sampler produces valid data for memcached.
+
+    Run this before the full experiment matrix to confirm that the host can reach
+    the guest's memcached on port 11211 via the VM's network namespace, and that
+    the TCP burst function returns real throughput (not the failure sentinel).
+    """
+    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, 512)
+    _check_workload_tools(vm, "memcached_light")
+    _setup_memcached(vm, 512)
+
+    guest_ip = vm.iface["eth0"]["iface"].guest_ip
+    handle = _start_timeseries_sampler(guest_ip, "memcached_light", netns_id=vm.netns.id)
+    time.sleep(5)
+    _stop_timeseries_sampler(handle)
+
+    samples = handle["samples"]
+    good = [s for s in samples if not s[6]]  # s[6] == failed flag
+    assert len(good) >= 5, (
+        f"Expected ≥5 successful samples, got {len(good)}/{len(samples)}. "
+        "Check stderr for the '[ts-memcached] burst failed' diagnostic line."
+    )
+    avg_tput = sum(s[1] for s in good) / len(good)
+    assert avg_tput > 1000, (
+        f"Expected throughput > 1000 ops/sec, got {avg_tput:.0f}. "
+        "Memcached may be responding but the burst is not completing."
+    )
+    logger.info(
+        "memcached timeseries OK: %d/%d samples good, avg throughput %.0f ops/sec",
+        len(good), len(samples), avg_tput,
+    )
+    vm.kill()
