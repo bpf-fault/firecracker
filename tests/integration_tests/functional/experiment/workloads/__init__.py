@@ -6,20 +6,11 @@ import pytest
 
 from ..constants import MEMCACHED_WORKLOAD_PARAMS, REDIS_WORKLOAD_PARAMS
 from .memcached import (
-    _measure_memcached_baseline,
-    _measure_post_snapshot_memcached,
-    _parse_memtier_output,
+    _assert_port_reachable,
     _setup_memcached,
-    _start_memcached_background_workload,
-    _start_memcached_during_burst,
 )
 from .redis import (
-    _collect_redis_during_results,
-    _measure_post_snapshot_redis,
-    _measure_redis_baseline,
-    _parse_memtier_json,
     _setup_redis,
-    _start_redis_during_burst,
 )
 from .stream import (
     _parse_stream_output,
@@ -95,17 +86,8 @@ __all__ = [
     "_measure_workload_throughput",
     "_stop_workload",
     "_setup_redis",
-    "_parse_memtier_json",
-    "_collect_redis_during_results",
-    "_measure_redis_baseline",
-    "_measure_post_snapshot_redis",
-    "_start_redis_during_burst",
     "_setup_memcached",
-    "_parse_memtier_output",
-    "_measure_memcached_baseline",
-    "_measure_post_snapshot_memcached",
-    "_start_memcached_background_workload",
-    "_start_memcached_during_burst",
+    "_assert_port_reachable",
     "_parse_stream_output",
     "_run_stream_benchmark",
     "_start_stream_during_burst",

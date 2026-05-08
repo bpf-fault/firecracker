@@ -37,7 +37,11 @@ from .experiment import (
     _run_live_snapshot_app,
     _write_csv_row,
 )
-from .experiment.timeseries import _start_timeseries_sampler, _stop_timeseries_sampler
+from .experiment.timeseries import (
+    _parse_memtier_windows,
+    _start_memtier,
+    _stop_memtier,
+)
 from .experiment.workloads.memcached import _setup_memcached
 
 logger = logging.getLogger(__name__)
@@ -269,7 +273,7 @@ def test_full_snapshot_app_experiment(
     """Collect full-snapshot metrics under Redis, Memcached, or STREAM workload."""
     vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
     _check_workload_tools(vm, workload)
-    row = _run_full_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
+    row = _run_full_snapshot_app(vm, mem_size_mib, workload, iteration)
     record_property("downtime_us", row.get("downtime_us", 0))
     record_property("full_throughput_mibs", row.get("full_throughput_mibs", 0))
     record_property("restore_api_ms", row.get("restore_api_ms", 0))
@@ -336,34 +340,30 @@ def test_live_bpf_snapshot_app_experiment(
 @pytest.mark.nonci
 @pytest.mark.timeout(120)
 def test_memcached_timeseries_quick(uvm_plain, microvm_factory):
-    """Smoke test: verify the host-side TCP timeseries sampler produces valid data for memcached.
+    """Smoke test: verify the host-side memtier timeseries produces valid data for memcached.
 
     Run this before the full experiment matrix to confirm that the host can reach
-    the guest's memcached on port 11211 via the VM's network namespace, and that
-    the TCP burst function returns real throughput (not the failure sentinel).
+    the guest's memcached on port 11211 via the VM's network namespace and that
+    memtier returns real throughput in its Time-Serie buckets.
     """
+    from .experiment.constants import MEMCACHED_WORKLOAD_PARAMS
+
     vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, 512)
     _check_workload_tools(vm, "memcached_light")
     _setup_memcached(vm, 512)
 
     guest_ip = vm.iface["eth0"]["iface"].guest_ip
-    handle = _start_timeseries_sampler(guest_ip, "memcached_light", netns_id=vm.netns.id)
+    params   = MEMCACHED_WORKLOAD_PARAMS["memcached_light"]
+    handle   = _start_memtier(guest_ip, vm.netns.id, "memcache_text", params, duration_sec=10)
     time.sleep(5)
-    _stop_timeseries_sampler(handle)
+    snap_start = time.monotonic() - handle["start_wall"]
+    _stop_memtier(handle)
 
-    samples = handle["samples"]
-    good = [s for s in samples if not s[6]]  # s[6] == failed flag
-    assert len(good) >= 5, (
-        f"Expected ≥5 successful samples, got {len(good)}/{len(samples)}. "
-        "Check stderr for the '[ts-memcached] burst failed' diagnostic line."
+    baseline, _, _ = _parse_memtier_windows(handle, snap_start, snap_start)
+    ops_s = baseline[0]
+    assert ops_s > 1000, (
+        f"Expected baseline throughput > 1000 ops/sec, got {ops_s:.0f}. "
+        "Check that memcached is running and reachable via the TAP interface."
     )
-    avg_tput = sum(s[1] for s in good) / len(good)
-    assert avg_tput > 1000, (
-        f"Expected throughput > 1000 ops/sec, got {avg_tput:.0f}. "
-        "Memcached may be responding but the burst is not completing."
-    )
-    logger.info(
-        "memcached timeseries OK: %d/%d samples good, avg throughput %.0f ops/sec",
-        len(good), len(samples), avg_tput,
-    )
+    logger.info("memcached timeseries OK: baseline %.0f ops/sec", ops_s)
     vm.kill()

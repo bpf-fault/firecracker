@@ -66,28 +66,14 @@ RESULTS_FILE = os.environ.get(
 
 TIMESERIES_DIR = os.path.join(os.path.dirname(RESULTS_FILE), "timeseries")
 
-# Timeseries sampler tuning.
-# TIMESERIES_INTERVAL_S: target wall-clock gap between samples.
-#   Lower values give finer granularity but more SSH overhead.
-#   At 0.1 s (default) a ~5–50 ms live-snapshot freeze appears only as a gap
-#   between samples; drop to ~0.005 s to capture the freeze as a data point.
-# TIMESERIES_SAMPLE_OPS: redis-benchmark ops per sample.
-#   Fewer ops = noisier per-sample throughput estimate but shorter sample
-#   duration, which matters when TIMESERIES_INTERVAL_S is small.
+# Timeseries resolution: passed as --stats-interval to memtier_benchmark.
+# At 0.1 s each bucket captures 100 ms of traffic; the live-snapshot freeze
+# (~20 ms) appears as a near-zero-throughput bucket rather than a full gap.
 TIMESERIES_INTERVAL_S = 0.1
-TIMESERIES_SAMPLE_OPS = 500
 
-# Timeseries backend selection.
-# "tcp"     — custom raw TCP RESP sampler (100ms resolution, configurable timeout)
-# "memtier" — host-side memtier_benchmark subprocess (1-second resolution, exact
-#             percentiles from memtier's JSON Time-Serie field, no per-request timeout)
-TIMESERIES_BACKEND = "tcp"
-
-# Socket timeout for the TCP backend's per-sample recv() calls (seconds).
-# Raised from 0.25 to 2.0 so that slow responses during the UFFD write-protect
-# streaming phase are captured as real high-latency data points rather than
-# being uniformly clipped to "failed".
-TIMESERIES_TIMEOUT_S = 2.0
+# Per-window measurement durations (seconds).
+BASELINE_WINDOW_SEC = 10   # pre-snapshot steady-state window
+POST_WINDOW_SEC     = 10   # post-snapshot recovery window
 
 CSV_FIELDS = [
     "timestamp",

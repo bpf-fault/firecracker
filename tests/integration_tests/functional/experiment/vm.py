@@ -61,6 +61,47 @@ def _do_full_snapshot_timed(vm):
     return snapshot, timings
 
 
+def _do_full_snapshot_resume_timed(vm):
+    """Take a full snapshot then resume the same VM, returning (snapshot, timing_dict).
+
+    Unlike _do_full_snapshot_timed this does not leave the VM paused: after the
+    snapshot files are written the VM is immediately resumed so the workload
+    continues on the same instance.  Callers are responsible for deleting the
+    returned snapshot when it is no longer needed.
+    """
+    t0 = time.monotonic()
+    vm.pause()
+    t_paused = time.monotonic()
+    vm.api.snapshot_create.put(
+        mem_file_path="mem",
+        snapshot_path="vmstate",
+        snapshot_type="Full",
+    )
+    t_created = time.monotonic()
+    vm.resume()
+
+    root = Path(vm.chroot())
+    snapshot = Snapshot(
+        vmstate=root / "vmstate",
+        mem=root / "mem",
+        disks=vm.disks,
+        net_ifaces=[x["iface"] for _, x in vm.iface.items()],
+        ssh_key=vm.ssh_key,
+        snapshot_type=SnapshotType.FULL,
+        meta={
+            "kernel_file": str(vm.kernel_file),
+            "vcpus_count": vm.vcpus_count,
+        },
+    )
+
+    timings = {
+        "full_pause_ms":  (t_paused  - t0) * 1000,
+        "full_create_ms": (t_created - t_paused) * 1000,
+        "full_total_ms":  (t_created - t0) * 1000,
+    }
+    return snapshot, timings
+
+
 def _do_restore_timed(factory, snapshot):
     """Restore a snapshot, returning (vm, timing_dict)."""
     rvm = factory.build(monitor_memory=False)
