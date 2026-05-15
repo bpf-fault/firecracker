@@ -99,7 +99,7 @@ _step "Step 3: Download test artifacts"
 
 # A collect-only run triggers artifact download without executing any tests.
 _log "Triggering artifact download via devtool (collect-only)..."
-./tools/devtool -y test -- \
+sudo ./tools/devtool -y test -- \
     --collect-only integration_tests/functional/test_api.py -q 2>&1 | head -10 || true
 
 # Locate the artifact directory.
@@ -300,7 +300,7 @@ if $NO_SMOKE; then
     _log "Skipping smoke test (--no-smoke-test)."
 else
     _log "Running quick synthetic smoke test (all 3 modes, 512 MiB, no app rootfs needed)..."
-    ./tools/devtool -y test -- \
+    sudo ./tools/devtool -y test -- \
         -k "test_snapshot_experiment_quick" \
         integration_tests/functional/test_snapshot_live_experiment.py \
         -s --log-cli-level=INFO -m ""
