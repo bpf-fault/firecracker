@@ -116,10 +116,17 @@ KERNEL_BTF="/sys/kernel/btf/vmlinux"
 if [[ -f "$BPF_OBJ" ]]; then
     _log "BPF object already exists: $BPF_OBJ — skipping."
 else
-    for tool in bpftool clang; do
-        command -v "$tool" &>/dev/null || \
-            _die "$tool not found — install it: sudo apt-get install bpftool clang"
-    done
+    command -v clang &>/dev/null || \
+        _die "clang not found — install it: sudo apt-get install clang"
+
+    # Ubuntu's /usr/sbin/bpftool is a wrapper that rejects non-packaged kernels.
+    # Fall back to the versioned binary directly if the wrapper fails.
+    BPFTOOL=bpftool
+    if ! bpftool version &>/dev/null; then
+        BPFTOOL=$(find /usr/lib/linux-tools -name bpftool 2>/dev/null | head -1)
+        [[ -n "$BPFTOOL" ]] || _die "bpftool not found — install it: sudo apt-get install linux-tools-common"
+        _log "Using bpftool at: $BPFTOOL"
+    fi
     # Locate libbpf headers; install libbpf-dev if missing.
     BPF_INCLUDE=$(find /usr/include /usr/local/include \
                        -path "*/bpf/bpf_helpers.h" 2>/dev/null | head -1)
@@ -138,20 +145,25 @@ else
         *) _die "Unsupported architecture for BPF compilation: $(uname -m)" ;;
     esac
 
-    # Choose BTF source. The BPF program uses types from the bpf-fault patched
-    # kernel (bpf_fault_ops_ctx, fault_ops) that are absent from a stock kernel.
-    # Use the patched vmlinux if available; fall back to running kernel BTF with
-    # a warning (the build will likely fail if the types are missing).
-    if [[ -f "$BPF_VMLINUX" ]]; then
-        _log "Generating vmlinux.h from patched kernel: $BPF_VMLINUX ..."
-        bpftool btf dump file "$BPF_VMLINUX" format c > "$VMLINUX_H"
-    elif [[ -f "$KERNEL_BTF" ]]; then
-        _warn "Patched kernel vmlinux not found at $BPF_VMLINUX; falling back to running kernel BTF."
-        _warn "Compilation may fail if bpf_fault_ops_ctx / fault_ops are not in the running kernel."
-        _warn "Override with: BPF_VMLINUX=/path/to/bpf-fault/vmlinux $0 $*"
-        bpftool btf dump file "$KERNEL_BTF" format c > "$VMLINUX_H"
+    # Choose BTF source. The BPF program uses types (bpf_fault_ops_ctx, fault_ops)
+    # that only exist in the bpf-fault patched kernel.
+    # Prefer the running kernel's BTF when the patched kernel is booted (types
+    # present in /sys/kernel/btf/vmlinux); otherwise fall back to the static
+    # vmlinux ELF so the object can be pre-built on a stock kernel.
+    _RUNNING_HAS_TYPES=false
+    if [[ -f "$KERNEL_BTF" ]]; then
+        $BPFTOOL btf dump file "$KERNEL_BTF" format c 2>/dev/null \
+            | grep -q "bpf_fault_ops_ctx" && _RUNNING_HAS_TYPES=true || true
+    fi
+
+    if $_RUNNING_HAS_TYPES; then
+        _log "Generating vmlinux.h from running patched kernel BTF ($KERNEL_BTF) ..."
+        $BPFTOOL btf dump file "$KERNEL_BTF" format c > "$VMLINUX_H"
+    elif [[ -f "$BPF_VMLINUX" ]]; then
+        _log "Generating vmlinux.h from static patched kernel: $BPF_VMLINUX ..."
+        $BPFTOOL btf dump file "$BPF_VMLINUX" format c > "$VMLINUX_H"
     else
-        _die "No BTF source found. Set BPF_VMLINUX=/path/to/bpf-fault/vmlinux."
+        _die "No BTF source with bpf_fault types found. Boot the bpf-fault kernel or set BPF_VMLINUX=/path/to/vmlinux."
     fi
 
     _log "Compiling BPF program (arch=$BPF_ARCH, include=$BPF_INCLUDE) → $BPF_OBJ ..."
