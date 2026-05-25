@@ -11,12 +11,16 @@
 #   --no-smoke-test   Skip the quick synthetic smoke test at the end
 #
 # Override paths with env vars:
-#   MEMTIER_REPO   (default: git@github.com:bpf-fault/memtier_benchmark.git)
-#   MEMTIER_SRC    (default: /mydata/memtier_benchmark)
-#   BPFFAULT_REPO  (default: git@github.com:bpf-fault/bpf-fault.git)
-#   BPFFAULT_DIR   (default: /mydata/bpf-fault)
-#   BENCH_DIR      (default: /mydata/bpf-fault/bench)
+#   MEMTIER_REPO    (default: git@github.com:bpf-fault/memtier_benchmark.git)
+#   MEMTIER_SRC     (default: /mydata/memtier_benchmark)
+#   BPFFAULT_REPO   (default: git@github.com:bpf-fault/bpf-fault.git)
+#   BPFFAULT_DIR    (default: /mydata/bpf-fault)
+#   BENCH_DIR       (default: /mydata/bpf-fault/bench)
 #   APP_ROOTFS_SIZE (default: 2G)
+#   BPF_VMLINUX     (default: /mydata/linux-bpf-fault/vmlinux)
+#                   Path to the bpf-fault patched kernel ELF (needed for vmlinux.h BTF).
+#                   The BPF program uses types (bpf_fault_ops_ctx, fault_ops) that only
+#                   exist in the patched kernel; a stock kernel BTF will cause a build error.
 
 set -euo pipefail
 
@@ -29,6 +33,7 @@ BPFFAULT_REPO="${BPFFAULT_REPO:-git@github.com:bpf-fault/bpf-fault.git}"
 BPFFAULT_DIR="${BPFFAULT_DIR:-/mydata/bpf-fault}"
 BENCH_DIR="${BENCH_DIR:-/mydata/bpf-fault/bench}"
 APP_ROOTFS_SIZE="${APP_ROOTFS_SIZE:-2G}"
+BPF_VMLINUX="${BPF_VMLINUX:-/mydata/linux-bpf-fault/vmlinux}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
@@ -86,9 +91,71 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2 — Build Firecracker release
+# Step 2 — Compile BPF object (host, before devtool)
 # ---------------------------------------------------------------------------
-_step "Step 2: Build Firecracker (release)"
+_step "Step 2: Compile BPF object (host)"
+
+BPF_DIR="$REPO_ROOT/resources/bpf"
+BPF_SRC="$BPF_DIR/snapshot_fault_ops.bpf.c"
+BPF_OBJ="$BPF_DIR/snapshot_fault_ops.bpf.o"
+VMLINUX_H="$BPF_DIR/vmlinux.h"
+KERNEL_BTF="/sys/kernel/btf/vmlinux"
+
+if [[ -f "$BPF_OBJ" ]]; then
+    _log "BPF object already exists: $BPF_OBJ — skipping."
+else
+    for tool in bpftool clang; do
+        command -v "$tool" &>/dev/null || \
+            _die "$tool not found — install it: sudo apt-get install bpftool clang"
+    done
+    # Locate libbpf headers; install libbpf-dev if missing.
+    BPF_INCLUDE=$(find /usr/include /usr/local/include \
+                       -path "*/bpf/bpf_helpers.h" 2>/dev/null | head -1)
+    if [[ -z "$BPF_INCLUDE" ]]; then
+        _log "libbpf headers not found — installing libbpf-dev..."
+        sudo apt-get install -y libbpf-dev
+        BPF_INCLUDE=$(find /usr/include /usr/local/include \
+                           -path "*/bpf/bpf_helpers.h" 2>/dev/null | head -1)
+    fi
+    BPF_INCLUDE="${BPF_INCLUDE%/bpf/bpf_helpers.h}"  # strip to parent include dir
+
+    # Map uname -m → BPF arch define (matches build.rs logic).
+    case "$(uname -m)" in
+        x86_64)  BPF_ARCH="__TARGET_ARCH_x86" ;;
+        aarch64) BPF_ARCH="__TARGET_ARCH_aarch64" ;;
+        *) _die "Unsupported architecture for BPF compilation: $(uname -m)" ;;
+    esac
+
+    # Choose BTF source. The BPF program uses types from the bpf-fault patched
+    # kernel (bpf_fault_ops_ctx, fault_ops) that are absent from a stock kernel.
+    # Use the patched vmlinux if available; fall back to running kernel BTF with
+    # a warning (the build will likely fail if the types are missing).
+    if [[ -f "$BPF_VMLINUX" ]]; then
+        _log "Generating vmlinux.h from patched kernel: $BPF_VMLINUX ..."
+        bpftool btf dump file "$BPF_VMLINUX" format c > "$VMLINUX_H"
+    elif [[ -f "$KERNEL_BTF" ]]; then
+        _warn "Patched kernel vmlinux not found at $BPF_VMLINUX; falling back to running kernel BTF."
+        _warn "Compilation may fail if bpf_fault_ops_ctx / fault_ops are not in the running kernel."
+        _warn "Override with: BPF_VMLINUX=/path/to/bpf-fault/vmlinux $0 $*"
+        bpftool btf dump file "$KERNEL_BTF" format c > "$VMLINUX_H"
+    else
+        _die "No BTF source found. Set BPF_VMLINUX=/path/to/bpf-fault/vmlinux."
+    fi
+
+    _log "Compiling BPF program (arch=$BPF_ARCH, include=$BPF_INCLUDE) → $BPF_OBJ ..."
+    clang -O2 -g -target bpf \
+        "-D$BPF_ARCH" \
+        "-I$BPF_INCLUDE" \
+        "-I$BPF_DIR" \
+        -c "$BPF_SRC" -o "$BPF_OBJ"
+
+    _log "BPF object ready: $BPF_OBJ"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3 — Build Firecracker release
+# ---------------------------------------------------------------------------
+_step "Step 3: Build Firecracker (release)"
 
 FC_BINARY="build/cargo_target/x86_64-unknown-linux-musl/release/firecracker"
 if $SKIP_BUILD && [[ -f "$FC_BINARY" ]]; then
@@ -99,9 +166,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — Download test artifacts and locate them
+# Step 4 — Download test artifacts and locate them
 # ---------------------------------------------------------------------------
-_step "Step 3: Download test artifacts"
+_step "Step 4: Download test artifacts"
 
 # A collect-only run triggers artifact download without executing any tests.
 _log "Triggering artifact download via devtool (collect-only)..."
@@ -126,9 +193,9 @@ BASE_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04.ext4"
 APP_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04-app.ext4"
 
 # ---------------------------------------------------------------------------
-# Step 4 — Host memtier_benchmark (bpf-fault fork with --stats-interval)
+# Step 5 — Host memtier_benchmark (bpf-fault fork with --stats-interval)
 # ---------------------------------------------------------------------------
-_step "Step 4: Host memtier_benchmark (bpf-fault fork)"
+_step "Step 5: Host memtier_benchmark (bpf-fault fork)"
 
 if $SKIP_MEMTIER; then
     _log "Skipping memtier_benchmark install (--skip-memtier)."
@@ -163,9 +230,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5 — bpf-fault bench repo
+# Step 6 — bpf-fault bench repo
 # ---------------------------------------------------------------------------
-_step "Step 5: bpf-fault bench repo"
+_step "Step 6: bpf-fault bench repo"
 
 if [[ ! -d "$BPFFAULT_DIR" ]]; then
     _log "Cloning $BPFFAULT_REPO → $BPFFAULT_DIR ..."
@@ -177,9 +244,9 @@ mkdir -p "$BENCH_DIR/results"
 _log "Bench dir ready: $BENCH_DIR"
 
 # ---------------------------------------------------------------------------
-# Step 6 — Build app rootfs
+# Step 7 — Build app rootfs
 # ---------------------------------------------------------------------------
-_step "Step 6: Build app rootfs (ubuntu-24.04-app.ext4)"
+_step "Step 7: Build app rootfs (ubuntu-24.04-app.ext4)"
 
 if $SKIP_ROOTFS && [[ -f "$APP_ROOTFS" ]]; then
     _log "Skipping rootfs build (--skip-rootfs, image exists at $APP_ROOTFS)."
@@ -298,9 +365,9 @@ CHROOT
 fi
 
 # ---------------------------------------------------------------------------
-# Step 7 — Smoke test
+# Step 8 — Smoke test
 # ---------------------------------------------------------------------------
-_step "Step 7: Smoke test"
+_step "Step 8: Smoke test"
 
 if $NO_SMOKE; then
     _log "Skipping smoke test (--no-smoke-test)."
