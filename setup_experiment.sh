@@ -75,6 +75,12 @@ if ! command -v docker &>/dev/null; then
     sudo usermod -aG docker "$USER"
     _log "Re-executing script under the docker group to activate new membership..."
     exec sg docker -c "$(printf '%q ' "$BASH_SOURCE" "$@")"
+elif ! docker ps &>/dev/null; then
+    # Docker is installed but the socket is inaccessible in this session
+    # (e.g. group was added in a prior run but the shell hasn't picked it up).
+    _log "Docker socket not accessible; re-executing under docker group..."
+    sudo usermod -aG docker "$USER"
+    exec sg docker -c "$(printf '%q ' "$BASH_SOURCE" "$@")"
 else
     _log "Docker already installed: $(docker --version)"
 fi
