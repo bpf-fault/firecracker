@@ -396,6 +396,16 @@ CHROOT
     sudo umount /mnt
 
     _log "App rootfs ready: $APP_ROOTFS"
+
+    # The test framework derives the SSH key path as rootfs.with_suffix(".id_rsa").
+    # The app rootfs reuses the base image's authorized_keys, so copy its key.
+    APP_KEY="${APP_ROOTFS%.ext4}.id_rsa"
+    BASE_KEY="${BASE_ROOTFS%.ext4}.id_rsa"
+    if [[ ! -f "$APP_KEY" ]]; then
+        [[ -f "$BASE_KEY" ]] || _die "Base SSH key not found: $BASE_KEY"
+        cp "$BASE_KEY" "$APP_KEY"
+        _log "SSH key copied: $BASE_KEY → $APP_KEY"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -429,7 +439,6 @@ echo "  python3 tests/integration_tests/functional/run_snapshot_benchmark.py \\"
 echo "    --workload redis_light \\"
 echo "    --mem-sizes 2048 \\"
 echo "    --iterations 1 \\"
-echo "    --rootfs $APP_ROOTFS \\"
 echo "    --bench-dir $BENCH_DIR"
 echo ""
 echo "Run the full benchmark (all workloads, all mem sizes, 3 iterations each):"
@@ -437,6 +446,5 @@ echo ""
 echo "  for wl in redis_light redis_mixed redis_heavy memcached_light memcached_heavy stream; do"
 echo "    python3 tests/integration_tests/functional/run_snapshot_benchmark.py \\"
 echo "      --workload \"\$wl\" \\"
-echo "      --rootfs $APP_ROOTFS \\"
 echo "      --bench-dir $BENCH_DIR"
 echo "  done"
