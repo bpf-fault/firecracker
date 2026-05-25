@@ -73,8 +73,8 @@ if ! command -v docker &>/dev/null; then
     sudo apt-get update -qq
     sudo apt-get install -y docker.io
     sudo usermod -aG docker "$USER"
-    _warn "Added $USER to the 'docker' group. You may need to log out and back in for this to take effect."
-    _warn "If devtool fails with a permission error, run: newgrp docker"
+    _log "Re-executing script under the docker group to activate new membership..."
+    exec sg docker -c "$(printf '%q ' "$BASH_SOURCE" "$@")"
 else
     _log "Docker already installed: $(docker --version)"
 fi
