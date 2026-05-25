@@ -73,6 +73,18 @@ for tool in git sudo make; do
     command -v "$tool" &>/dev/null || _die "Required tool not found: $tool — install it first."
 done
 
+if ! command -v aws &>/dev/null; then
+    _log "AWS CLI not found. Installing AWS CLI v2..."
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+    sudo apt-get install -y -qq unzip
+    cd /tmp && unzip -q awscliv2.zip
+    sudo /tmp/aws/install
+    cd "$REPO_ROOT"
+    _log "AWS CLI installed: $(aws --version)"
+else
+    _log "AWS CLI already installed: $(aws --version)"
+fi
+
 if ! command -v docker &>/dev/null; then
     _log "Docker not found. Installing docker.io..."
     sudo apt-get update -qq
@@ -170,26 +182,33 @@ fi
 # ---------------------------------------------------------------------------
 _step "Step 4: Download test artifacts"
 
-# A collect-only run triggers artifact download without executing any tests.
-_log "Triggering artifact download via devtool (collect-only)..."
-sudo ./tools/devtool -y test -- \
-    --collect-only integration_tests/functional/test_api.py -q 2>&1 | head -10 || true
+# devtool ensure_current_artifacts: syncs squashfs files from S3, runs
+# setup-ci-artifacts.sh inside the container to convert them to ext4 and
+# inject SSH keys, and writes the path to build/current_artifacts.
+#
+# The artifact directory may be root-owned (written by the container). If it
+# exists but has no ext4 files (incomplete download), we must remove it with
+# sudo before re-running, otherwise devtool skips the conversion step.
 
-# Locate the artifact directory.
-if [[ -f build/current_artifacts ]]; then
-    ARTIFACTS_DIR=$(cat build/current_artifacts)
-    _log "Artifacts at: $ARTIFACTS_DIR"
-elif ls build/artifacts/ 2>/dev/null | grep -qv '^x86_64$'; then
-    HASH=$(ls build/artifacts/ | grep -v '^x86_64$' | tail -1)
-    ARTIFACTS_DIR="build/artifacts/$HASH/x86_64"
-    _log "Artifacts at: $ARTIFACTS_DIR (resolved from build/artifacts/)"
+# Look for an already-converted artifacts directory.
+_ext4=$(find build/artifacts -name "ubuntu-24.04.ext4" 2>/dev/null | head -1 || true)
+if [[ -n "$_ext4" ]]; then
+    ARTIFACTS_DIR=$(dirname "$_ext4")
+    _log "Artifacts already set up at: $ARTIFACTS_DIR"
 else
-    _die "Cannot find test artifacts. Ensure 'devtool build --release' completed successfully."
+    if [[ -d build/artifacts ]]; then
+        _log "Removing incomplete artifact directory (may be root-owned)..."
+        sudo rm -rf build/artifacts
+    fi
+    _log "Downloading and converting test artifacts..."
+    sudo ./tools/devtool -y ensure_current_artifacts
+    _ext4=$(find build/artifacts -name "ubuntu-24.04.ext4" 2>/dev/null | head -1 || true)
+    [[ -n "$_ext4" ]] || _die "Artifact setup failed: ubuntu-24.04.ext4 not found after download."
+    ARTIFACTS_DIR=$(dirname "$_ext4")
+    _log "Artifacts at: $ARTIFACTS_DIR"
 fi
 
 BASE_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04.ext4"
-[[ -f "$BASE_ROOTFS" ]] || _die "Base rootfs not found: $BASE_ROOTFS"
-
 APP_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04-app.ext4"
 
 # ---------------------------------------------------------------------------
@@ -254,7 +273,8 @@ else
     [[ -f "$BASE_ROOTFS" ]] || _die "Base rootfs not found: $BASE_ROOTFS"
 
     _log "Copying base rootfs → $APP_ROOTFS ..."
-    cp "$BASE_ROOTFS" "$APP_ROOTFS"
+    sudo cp "$BASE_ROOTFS" "$APP_ROOTFS"
+    sudo chmod 644 "$APP_ROOTFS"
 
     _log "Expanding image to $APP_ROOTFS_SIZE ..."
     sudo truncate -s "$APP_ROOTFS_SIZE" "$APP_ROOTFS"
@@ -292,12 +312,14 @@ else
     sudo mount -o bind  /dev   /mnt/dev
     sudo mount -o bind  /dev/pts /mnt/dev/pts
 
-    # DNS: copy the host resolver config so apt can reach the internet.
-    sudo mkdir -p /mnt/run/systemd/resolve
-    if [[ -f /run/systemd/resolve/resolv.conf ]]; then
-        sudo cp /run/systemd/resolve/resolv.conf /mnt/run/systemd/resolve/resolv.conf
-    else
-        sudo cp /etc/resolv.conf /mnt/etc/resolv.conf
+    # DNS: replace the chroot's /etc/resolv.conf symlink (→ systemd stub at
+    # 127.0.0.53) with the host's real resolver so apt can reach the internet.
+    _REAL_RESOLV=""
+    [[ -f /run/systemd/resolve/resolv.conf ]] && _REAL_RESOLV=/run/systemd/resolve/resolv.conf
+    [[ -z "$_REAL_RESOLV" && -f /etc/resolv.conf ]]  && _REAL_RESOLV=/etc/resolv.conf
+    if [[ -n "$_REAL_RESOLV" ]]; then
+        sudo rm -f /mnt/etc/resolv.conf
+        sudo cp "$_REAL_RESOLV" /mnt/etc/resolv.conf
     fi
 
     _log "Installing packages inside chroot (this takes several minutes)..."
