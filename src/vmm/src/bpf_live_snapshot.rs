@@ -54,8 +54,10 @@ const BPF_LINK_FAULT_OPS_CMD: u32 = 38;
 /// BPF attach type for fault_ops.
 const BPF_FAULT_OPS: u32 = 58;
 
-/// bpf_fault WP enable flag.
+/// bpf_fault WP enable flag (BPF_LINK_FAULT_OPS_CMD flags).
 const BPF_FAULT_WP_ENABLE: u32 = 1;
+/// bpf_fault register-region flag (BPF_LINK_FAULT_OPS_CMD flags).
+const BPF_FAULT_REGISTER: u32 = 2;
 /// bpf_fault WP flag for link creation.
 const BPF_FAULT_FLAG_WP: u32 = 1;
 
@@ -379,6 +381,22 @@ fn bpf_create_fault_link(
         })?
     };
     Ok(link_fd as RawFd)
+}
+
+/// Adds a memory region to an existing bpf_fault link (BPF_FAULT_REGISTER).
+///
+/// After the first region is registered via `bpf_create_fault_link`, subsequent
+/// regions are added with this call rather than creating a new link each time.
+fn bpf_fault_register_region(link_fd: RawFd, addr: u64, len: u64) -> Result<(), String> {
+    let mut attr = [0u8; 32];
+    attr[0..4].copy_from_slice(&link_fd.cast_unsigned().to_ne_bytes());
+    attr[4..8].copy_from_slice(&BPF_FAULT_REGISTER.to_ne_bytes());
+    attr[8..16].copy_from_slice(&addr.to_ne_bytes());
+    attr[16..24].copy_from_slice(&len.to_ne_bytes());
+
+    // SAFETY: attr is a valid BPF_LINK_FAULT_OPS_CMD attribute.
+    unsafe { sys_bpf(BPF_LINK_FAULT_OPS_CMD, attr.as_mut_ptr(), 32)? };
+    Ok(())
 }
 
 /// Enables write-protection on a memory range via an existing bpf_fault link.
@@ -1048,6 +1066,10 @@ pub(crate) fn phase2_freeze_bpf(
     let t_after_save_state = t_freeze_start.elapsed();
 
     // Attach bpf_fault to all plugged memory slots and enable WP.
+    //
+    // A single link is created for the first slot; all subsequent slots are
+    // added to the same link via BPF_FAULT_REGISTER.  This mirrors the uffd
+    // path (one fd, N register calls) and avoids creating N kernel link objects.
     let mut slot_ranges: Vec<SlotRange> = Vec::new();
     let mut page_index = 0usize;
     {
@@ -1057,29 +1079,33 @@ pub(crate) fn phase2_freeze_bpf(
                 let ptr = slot.slice.ptr_guard().as_ptr() as u64;
                 let len = slot.slice.len() as u64;
 
-                let link_fd = bpf_create_fault_link(
-                    phase1.bpf_obj.struct_ops_map_fd,
-                    ptr,
-                    len,
-                    BPF_FAULT_FLAG_WP,
-                )
-                .map_err(CreateSnapshotError::BpfAttach)?;
+                let link_fd = if guard.links.is_empty() {
+                    let fd = bpf_create_fault_link(
+                        phase1.bpf_obj.struct_ops_map_fd,
+                        ptr,
+                        len,
+                        BPF_FAULT_FLAG_WP,
+                    )
+                    .map_err(CreateSnapshotError::BpfAttach)?;
+                    // SAFETY: bpf_create_fault_link returned a valid link fd.
+                    guard.links.push(unsafe { BpfFaultLink::from_raw_fd(fd) });
+                    fd
+                } else {
+                    let fd = guard.links[0].as_raw_fd();
+                    bpf_fault_register_region(fd, ptr, len)
+                        .map_err(CreateSnapshotError::BpfAttach)?;
+                    fd
+                };
 
-                // SAFETY: bpf_create_fault_link returned a valid link fd.
-                let link = unsafe { BpfFaultLink::from_raw_fd(link_fd) };
-
-                bpf_fault_wp_enable(link.as_raw_fd(), ptr, len)
+                bpf_fault_wp_enable(link_fd, ptr, len)
                     .map_err(CreateSnapshotError::BpfWriteProtect)?;
-
-                let link_idx = guard.links.len();
-                guard.links.push(link);
 
                 let n_pages = (len as usize + page_size - 1) / page_size;
                 slot_ranges.push(SlotRange {
                     base_addr: ptr as usize,
                     page_count: n_pages,
                     page_index_start: page_index,
-                    link_index: link_idx,
+                    link_index: 0,
                 });
                 page_index += n_pages;
             }
