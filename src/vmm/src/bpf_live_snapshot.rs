@@ -58,6 +58,8 @@ const BPF_FAULT_OPS: u32 = 58;
 const BPF_FAULT_WP_ENABLE: u32 = 1;
 /// bpf_fault register-region flag (BPF_LINK_FAULT_OPS_CMD flags).
 const BPF_FAULT_REGISTER: u32 = 2;
+/// bpf_fault unregister-region flag (BPF_LINK_FAULT_OPS_CMD flags).
+const BPF_FAULT_UNREGISTER: u32 = 4;
 /// bpf_fault WP flag for link creation.
 const BPF_FAULT_FLAG_WP: u32 = 1;
 
@@ -381,6 +383,22 @@ fn bpf_create_fault_link(
         })?
     };
     Ok(link_fd as RawFd)
+}
+
+/// Removes a memory region from an existing bpf_fault link (BPF_FAULT_UNREGISTER).
+///
+/// Called per-slot at the end of Phase 3 so that `links.clear()` in Phase 4
+/// finds no VMAs left to walk, eliminating the `mmap_write_lock` stall.
+fn bpf_fault_unregister_region(link_fd: RawFd, addr: u64, len: u64) -> Result<(), String> {
+    let mut attr = [0u8; 32];
+    attr[0..4].copy_from_slice(&link_fd.cast_unsigned().to_ne_bytes());
+    attr[4..8].copy_from_slice(&BPF_FAULT_UNREGISTER.to_ne_bytes());
+    attr[8..16].copy_from_slice(&addr.to_ne_bytes());
+    attr[16..24].copy_from_slice(&len.to_ne_bytes());
+
+    // SAFETY: attr is a valid BPF_LINK_FAULT_OPS_CMD attribute.
+    unsafe { sys_bpf(BPF_LINK_FAULT_OPS_CMD, attr.as_mut_ptr(), 32)? };
+    Ok(())
 }
 
 /// Adds a memory region to an existing bpf_fault link (BPF_FAULT_REGISTER).
@@ -916,7 +934,22 @@ impl StreamingTask for BpfStreamingTask {
         info!("Live-BPF snapshot: Phase 4 - Finalize (worker)");
         let t_finalize_start = Instant::now();
 
-        // Drop BPF links to remove write-protection.
+        // Unregister each slot explicitly before dropping the link fd.
+        // This spreads mmap_write_lock acquisitions across N short per-VMA holds
+        // rather than one long hold over the entire guest address space, eliminating
+        // the ~200 ms throughput dip otherwise visible at the end of streaming.
+        if let Some(link) = self.links.first() {
+            let link_fd = link.as_raw_fd();
+            for sr in &self.slot_ranges {
+                let addr = sr.base_addr as u64;
+                let len = (sr.page_count * page_size) as u64;
+                if let Err(err) = bpf_fault_unregister_region(link_fd, addr, len) {
+                    warn!("Live-BPF: unregister_region failed at 0x{addr:x}: {err}");
+                }
+            }
+        }
+
+        // Drop link fd — all VMAs already unregistered above.
         self.links.clear();
 
         snapshot_state_to_file(&self.microvm_state, &self.snapshot_path)?;
