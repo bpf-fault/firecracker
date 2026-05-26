@@ -93,72 +93,16 @@ memtier_benchmark --version
 
 ## 3. Building the app rootfs
 
-The app rootfs is derived from the standard CI rootfs by installing Redis,
-memtier_benchmark, STREAM, and the Kerberos libraries that Ubuntu 24.04's sshd
-requires.
-
-> **Why Kerberos?**  Ubuntu 24.04's openssh-server binary links against
-> `libgssapi_krb5.so.2`, `libkrb5.so.3`, `libk5crypto.so.3`, `libkrb5support.so.0`,
-> and `libkeyutils.so.1`.  A systemd generator (`sshd-socket-generator`) also uses
-> these.  If any of these libraries are absent from the rootfs the generator exits with
-> code 127, `ssh.service` fails on every activation, systemd stops `ssh.socket`, and
-> every SSH connection is refused — even though the VM kernel is running and the network
-> is up.  This was the root cause of the "Connection refused" failures seen during
-> initial bring-up.
+Use `setup_experiment.sh` in the repo root — it handles artifact download, rootfs
+provisioning (Redis, memtier_benchmark, STREAM, Kerberos libs), SSH key copy, BPF
+pre-build, and a smoke test end-to-end:
 
 ```bash
-# Locate the current artifact hash
-HASH=$(ls build/artifacts/ | tail -1)
-ARTIFACTS=build/artifacts/$HASH/x86_64
-
-# Copy the base image (do NOT modify ubuntu-24.04.ext4 itself)
-cp $ARTIFACTS/ubuntu-24.04.ext4   $ARTIFACTS/ubuntu-24.04-app.ext4
-cp $ARTIFACTS/ubuntu-24.04.id_rsa $ARTIFACTS/ubuntu-24.04-app.id_rsa
-
-# Mount and provision
-sudo mount -o loop $ARTIFACTS/ubuntu-24.04-app.ext4 /mnt
-
-sudo chroot /mnt /bin/bash <<'EOF'
-set -e
-apt-get update -qq
-
-# --- SSH dependency: Kerberos / GSS-API libs (CRITICAL — do not skip) ---
-apt-get install -y libgssapi-krb5-2 libkrb5-3 libkeyutils1
-
-# --- Redis ---
-apt-get install -y redis-server redis-tools
-
-# --- memtier_benchmark (built from source; distro package is often too old) ---
-apt-get install -y git build-essential autoconf automake \
-    libpcre3-dev libevent-dev pkg-config zlib1g-dev libssl-dev
-git clone --depth=1 https://github.com/RedisLabs/memtier_benchmark.git /tmp/memtier
-cd /tmp/memtier
-autoreconf -ivf && ./configure && make -j$(nproc)
-cp memtier_benchmark /usr/local/bin/
-cd / && rm -rf /tmp/memtier
-
-# --- STREAM memory-bandwidth benchmark ---
-apt-get install -y gcc curl
-curl -fsSL https://www.cs.virginia.edu/stream/FTP/Code/stream.c -o /tmp/stream.c
-gcc -O2 -fopenmp -DSTREAM_ARRAY_SIZE=11184810 -DNTIMES=20 \
-    -o /usr/local/bin/stream /tmp/stream.c -lm
-rm /tmp/stream.c
-
-# --- Cleanup ---
-apt-get clean
-EOF
-
-sudo umount /mnt
+bash setup_experiment.sh
 ```
 
-Verify the image looks right:
-
-```bash
-sudo mount -o loop $ARTIFACTS/ubuntu-24.04-app.ext4 /mnt
-ldd /mnt/usr/sbin/sshd | grep "not found" && echo "MISSING LIBS" || echo "OK"
-ls /mnt/usr/bin/redis-server /mnt/usr/local/bin/memtier_benchmark /mnt/usr/local/bin/stream
-sudo umount /mnt
-```
+The script is idempotent: re-running it skips steps that are already done.
+See its inline comments for the full step list and any manual overrides.
 
 ---
 
@@ -239,32 +183,32 @@ EXPERIMENT_ROOTFS=/srv/test_artifacts/ubuntu-24.04-app.ext4 \
 
 ---
 
-## 5. Generating plots and analysis tables
+## 5. Generating plots and analysis
 
-Run these from the **repo root** (outside devtool) after experiments have populated
-`test_results/experiment_results.csv`.
+Use `run_snapshot_benchmark.py` to run tests and export results, then
+`plot_snapshot_benchmark.py` (in the bpf-fault bench repo) to produce figures.
+See `docs/snapshot-benchmark-runbook.md` for the full option reference.
 
 ```bash
-# Install dependencies once
-pip install matplotlib numpy
+# Run one workload and export to bpf-fault bench repo
+python3 tests/integration_tests/functional/run_snapshot_benchmark.py \
+    --workload redis_heavy \
+    --bench-dir /mydata/bpf-fault/bench
 
-# Generate ~14 PNG plots alongside the CSV
-python3 tests/integration_tests/functional/plot_experiment_results.py \
-    test_results/experiment_results.csv
-
-# Print text summary tables
-python3 tests/integration_tests/functional/analyze_experiment_results.py \
-    test_results/experiment_results.csv
+# Plot (from inside the bench repo)
+cd /mydata/bpf-fault/bench
+python3 plot_snapshot_benchmark.py results/snapshot_benchmark_redis_heavy.json \
+    --outdir fc_redis_heavy_figures
 ```
 
-Key plots for throughput/latency verification:
+Key output figures:
 
 | File | Content |
 |------|---------|
-| `09_app_ops_degradation.png` | Baseline / during / post ops/sec bars per workload |
-| `10_app_tail_latency.png` | p99 and avg latency baseline vs during vs post |
-| `14_three_window_throughput.png` | Throughput recovery across three windows |
-| `01_downtime_vs_mem.png` | Full vs live downtime across memory sizes |
+| `timeseries_<mem>mib_<mode>.png` | Throughput + latency over time with snapshot markers |
+| `throughput_during_snapshot.png` | Baseline vs live vs live_bpf throughput during phases 2–4 |
+| `tail_latency_comparison.png` | p99 latency during phases 2–4 per memory size |
+| `downtime_comparison.csv` | Full vs live vs live_bpf downtime, mean ± std |
 
 ---
 
