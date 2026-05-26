@@ -327,6 +327,32 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+# Per-test artifact directories created by pytest under test_results/.
+# Each contains UUID-named VM directories with logs and binary copies (~40 MB
+# each) that are only needed for post-failure debugging.
+_ARTIFACT_DIRS = [
+    *_MODE_TO_TEST.values(),           # test_{full,live,live_bpf}_snapshot_app_experiment
+    "test_snapshot_experiment_quick",  # smoke-test artifacts
+]
+
+
+def cleanup_test_artifacts():
+    """Remove per-test pytest artifact directories from test_results/.
+
+    Keeps experiment_results.csv, test-report.json, and timeseries/.
+    """
+    test_results = os.path.join(_REPO_ROOT, "test_results")
+    for name in _ARTIFACT_DIRS:
+        path = os.path.join(test_results, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            print(f"Removed {path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -349,6 +375,8 @@ def main():
                     help="Skip pytest; re-export from existing test_results/")
     ap.add_argument("--max-iteration", type=int, default=2,
                     help="Only include iterations 0..N (inclusive)")
+    ap.add_argument("--keep-artifacts", action="store_true",
+                    help="Keep per-test pytest artifact directories after a successful run")
     args = ap.parse_args()
 
     if not args.skip_run:
@@ -356,6 +384,9 @@ def main():
 
     export_results(args.workload, args.mem_sizes, args.bench_dir,
                    max_iteration=args.max_iteration)
+
+    if not args.skip_run and not args.keep_artifacts:
+        cleanup_test_artifacts()
 
 
 if __name__ == "__main__":
