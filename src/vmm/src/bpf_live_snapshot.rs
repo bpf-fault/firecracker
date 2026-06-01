@@ -934,29 +934,72 @@ impl StreamingTask for BpfStreamingTask {
         info!("Live-BPF snapshot: Phase 4 - Finalize (worker)");
         let t_finalize_start = Instant::now();
 
-        // Unregister each slot explicitly before dropping the link fd.
-        // This spreads mmap_write_lock acquisitions across N short per-VMA holds
-        // rather than one long hold over the entire guest address space, eliminating
-        // the ~200 ms throughput dip otherwise visible at the end of streaming.
+        // Unregister all WP-protected regions before dropping the link fd.
+        //
+        // Each BPF_FAULT_UNREGISTER call holds mmap_write_lock(mm) for the whole
+        // range it covers while it resolves the uffd-wp PTEs and clears the
+        // VMA's bpf_fault flags. For a multi-GiB guest a single full-region call
+        // holds the write lock for ~100-200 ms. That window blocks every other
+        // mmap_lock reader in the process — in particular the ordinary COW write
+        // faults the running guest keeps taking on still-zero-page-backed RAM
+        // (memory is faulted in read-only via MADV_POPULATE_READ at boot, so the
+        // guest's first write to each page COW-faults). The result is a sharp
+        // throughput dip at the end of the snapshot.
+        //
+        // Unregistering in small chunks keeps each individual call's write-lock
+        // hold short and, crucially, *releases* the lock between calls so those
+        // COW faults can interleave. Each chunk is still a complete, atomic
+        // per-range teardown (resolve + flag clear under the write lock), so this
+        // is exactly as safe as unregistering disjoint ranges — only finer
+        // grained. The cumulative work (and total teardown time) is essentially
+        // unchanged, but the per-fault stall drops from ~200 ms to ~1 ms.
+        //
+        // Dropping the link fd afterwards (`bpf_fault_release_all`) then finds no
+        // registered VMAs left and is a no-op.
+        const UNREG_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
+        let t_unreg_start = Instant::now();
         if let Some(link) = self.links.first() {
             let link_fd = link.as_raw_fd();
             for sr in &self.slot_ranges {
                 let addr = sr.base_addr as u64;
                 let len = (sr.page_count * page_size) as u64;
-                if let Err(err) = bpf_fault_unregister_region(link_fd, addr, len) {
-                    warn!("Live-BPF: unregister_region failed at 0x{addr:x}: {err}");
+                let mut off = 0u64;
+                while off < len {
+                    let clen = std::cmp::min(UNREG_CHUNK_BYTES, len - off);
+                    if let Err(err) = bpf_fault_unregister_region(link_fd, addr + off, clen) {
+                        warn!(
+                            "Live-BPF: unregister_region failed at 0x{:x}: {err}",
+                            addr + off
+                        );
+                    }
+                    off += clen;
                 }
             }
         }
+        let t_unreg = t_unreg_start.elapsed();
 
         // Drop link fd — all VMAs already unregistered above.
+        let t_clear_start = Instant::now();
         self.links.clear();
+        let t_clear = t_clear_start.elapsed();
 
+        let t_savestate_start = Instant::now();
         snapshot_state_to_file(&self.microvm_state, &self.snapshot_path)?;
+        let t_savestate = t_savestate_start.elapsed();
 
+        let t_sync_start = Instant::now();
         self.mem_file
             .sync_all()
             .map_err(|err| CreateSnapshotError::MemoryBackingFile("sync_all", err))?;
+        let t_sync = t_sync_start.elapsed();
+        info!(
+            "Live-BPF snapshot: Phase 4 breakdown — unregister={} us, link_drop={} us, \
+             save_state={} us, sync_all={} us",
+            t_unreg.as_micros(),
+            t_clear.as_micros(),
+            t_savestate.as_micros(),
+            t_sync.as_micros(),
+        );
 
         let t_total = self.t_start.elapsed();
         let finalize_us = t_finalize_start.elapsed().as_micros();

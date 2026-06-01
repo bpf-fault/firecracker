@@ -458,9 +458,32 @@ impl StreamingTask for UffdStreamingTask {
         info!("Live snapshot: Phase 4 - Finalize (worker)");
         let t_finalize_start = Instant::now();
 
-        // Unregister all memory from UFFD and drop it.
+        // Unregister all memory from UFFD in small chunks.
+        //
+        // uffd.unregister() (userfaultfd_clear_vma in the kernel) resolves the
+        // uffd-wp PTEs and clears the VMA flags under mmap_write_lock over the
+        // whole range. For a multi-GiB guest that single hold lasts ~100-200 ms
+        // and blocks every concurrent mmap_lock reader — notably the ordinary
+        // COW write faults the running guest keeps taking on zero-page-backed
+        // RAM (faulted in read-only via MADV_POPULATE_READ at boot). That stall
+        // is the throughput dip seen at the end of the snapshot.
+        //
+        // Chunking keeps each write-lock hold short and releases it between
+        // calls so those faults interleave. Each chunk is a complete, atomic
+        // per-range unregister, so this is exactly as safe as unregistering
+        // disjoint ranges — just finer grained.
+        const UNREG_CHUNK_BYTES: usize = 2 * 1024 * 1024;
         for region in &self.regions {
-            let _ = self.uffd.unregister(region.ptr, region.len);
+            let mut off = 0usize;
+            while off < region.len {
+                let clen = std::cmp::min(UNREG_CHUNK_BYTES, region.len - off);
+                // SAFETY: region.ptr..region.ptr+len is the registered range;
+                // ptr+off with off < len stays within it.
+                let chunk_ptr =
+                    unsafe { region.ptr.cast::<u8>().add(off).cast::<libc::c_void>() };
+                let _ = self.uffd.unregister(chunk_ptr, clen);
+                off += clen;
+            }
         }
 
         snapshot_state_to_file(&self.microvm_state, &self.snapshot_path)?;
