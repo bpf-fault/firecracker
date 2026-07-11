@@ -46,6 +46,17 @@ _log()  { echo "[setup] $*"; }
 _warn() { echo "[WARN]  $*" >&2; }
 _die()  { echo "[ERROR] $*" >&2; exit 1; }
 
+# memtier_benchmark's --help path returns a non-zero exit status by design
+# (memtier_benchmark.cpp: `case o_help: return -1;`), so under `set -o
+# pipefail` a naive `memtier_benchmark --help | grep -q ...` always reports
+# failure regardless of what grep actually matched. Capture the output
+# separately so memtier_benchmark's exit code can't poison the pipeline.
+_memtier_has_stats_interval() {
+    local help_output
+    help_output=$(memtier_benchmark --help 2>&1 || true)
+    grep -q "stats-interval" <<<"$help_output"
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -230,7 +241,7 @@ _step "Step 5: Host memtier_benchmark (bpf-fault fork)"
 
 if $SKIP_MEMTIER; then
     _log "Skipping memtier_benchmark install (--skip-memtier)."
-elif memtier_benchmark --help 2>&1 | grep -q "stats-interval"; then
+elif _memtier_has_stats_interval; then
     _log "memtier_benchmark with --stats-interval already installed at $(command -v memtier_benchmark)."
 else
     _log "Installing build dependencies..."
@@ -255,7 +266,7 @@ else
     sudo cp memtier_benchmark /usr/local/bin/
     cd "$REPO_ROOT"
 
-    memtier_benchmark --help 2>&1 | grep -q "stats-interval" || \
+    _memtier_has_stats_interval || \
         _die "Built memtier_benchmark does not have --stats-interval. Check the repo."
     _log "memtier_benchmark installed: $(command -v memtier_benchmark)"
 fi
