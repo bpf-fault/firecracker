@@ -1,9 +1,11 @@
 #!/bin/bash
 set -eu -o pipefail
 
-# Sets up everything needed for the snapshot benchmarks that lives in this
-# repo: system prerequisites (docker, AWS CLI), the BPF fault-ops object, the
-# Firecracker release build, CI guest artifacts, and the app rootfs.
+# Sets up everything needed for the snapshot benchmarks that live in this repo:
+# system prerequisites (docker, AWS CLI), the Firecracker release build, CI
+# guest artifacts, and the app rootfs.
+#
+# Must run on the bpf_fault kernel.
 #
 # Usage:
 #   ./setup_experiment.sh [options]
@@ -16,14 +18,14 @@ set -eu -o pipefail
 #
 # Override with env vars:
 #   APP_ROOTFS_SIZE (default: 2G)
-#   BPF_VMLINUX     Path to the bpf-fault patched kernel ELF, used to generate
-#                   vmlinux.h when not booted into the patched kernel. The BPF
-#                   program uses types (bpf_fault_ops_ctx, fault_ops) that only
-#                   exist in the patched kernel; a stock kernel BTF will cause
-#                   a build error.
+
+if ! uname -r | grep -q "bpf-fault"; then
+	echo "This script is intended to be run on a bpf_fault kernel."
+	echo "Please switch to the bpf_fault kernel and try again."
+	exit 1
+fi
 
 APP_ROOTFS_SIZE="${APP_ROOTFS_SIZE:-2G}"
-BPF_VMLINUX="${BPF_VMLINUX:-}"
 
 SCRIPT_PATH=$(realpath $0)
 BASE_DIR=$(dirname $SCRIPT_PATH)
@@ -44,18 +46,11 @@ for arg in "$@"; do
 	esac
 done
 
-# Install system prerequisites
-for tool in git sudo curl; do
-	if ! command -v "$tool" &>/dev/null; then
-		echo "Required tool not found: $tool. Please install it first."
-		exit 1
-	fi
-done
-
 # devtool uses the host AWS CLI to sync test artifacts from S3
 if ! command -v aws &>/dev/null; then
 	echo "Installing AWS CLI v2..."
 	curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+	sudo apt-get update -qq
 	sudo apt-get install -y -qq unzip
 	cd /tmp && unzip -q awscliv2.zip
 	sudo /tmp/aws/install
@@ -70,90 +65,51 @@ fi
 
 # Re-exec the script under the docker group so a fresh membership takes
 # effect. Guarded so a non-permission failure (e.g. daemon not running)
-# can't re-exec in an infinite loop.
-if ! docker ps &>/dev/null; then
+# can't re-exec in an infinite loop. timeout: with socket activation, a
+# crash-looping daemon leaves the socket accepting connections and docker ps
+# blocks forever instead of erroring.
+if ! timeout 10 docker ps &>/dev/null; then
 	if [[ "${_SETUP_REEXECED:-}" == "1" ]]; then
-		echo "Docker is still inaccessible after re-exec. Is the daemon running?"
+		echo "Docker is still inaccessible after re-exec."
+		echo "Check the daemon: systemctl status docker"
 		exit 1
 	fi
+	echo "Adding $USER to the docker group..."
 	sudo usermod -aG docker "$USER"
 	echo "Re-executing script under the docker group..."
 	exec sg docker -c "$(printf '%q ' env _SETUP_REEXECED=1 "$SCRIPT_PATH" "$@")"
 fi
 
-# Compile the BPF object on the host, before devtool: the devtool container
-# cannot see BPF_VMLINUX outside the repo mount.
+# Firecracker (and the KVM check in devtool test) needs rw access to /dev/kvm.
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+	echo "Granting $USER access to /dev/kvm..."
+	command -v setfacl &>/dev/null || sudo apt-get install -y acl
+	sudo setfacl -m "u:$USER:rw" /dev/kvm
+fi
+
+# Compile the BPF object on the host before devtool: build.rs embeds it via
+# include_bytes!, but the upstream dev container image ships no bpftool, so
+# in-container compilation is silently skipped. bpftool, clang, and the
+# libbpf headers in /usr/local are installed by the kernel build.
 BPF_DIR="$BASE_DIR/resources/bpf"
-BPF_SRC="$BPF_DIR/snapshot_fault_ops.bpf.c"
-BPF_OBJ="$BPF_DIR/snapshot_fault_ops.bpf.o"
-VMLINUX_H="$BPF_DIR/vmlinux.h"
-KERNEL_BTF="/sys/kernel/btf/vmlinux"
-
-if [[ -f "$BPF_OBJ" ]]; then
-	echo "BPF object already exists: $BPF_OBJ, skipping."
-else
-	if ! command -v clang &>/dev/null; then
-		echo "clang not found. Please install it: sudo apt-get install clang"
-		exit 1
-	fi
-
-	# Ubuntu's /usr/sbin/bpftool is a wrapper that rejects non-packaged kernels.
-	# Fall back to the versioned binary directly if the wrapper fails.
-	BPFTOOL=bpftool
-	if ! bpftool version &>/dev/null; then
-		BPFTOOL=$(find /usr/lib/linux-tools -name bpftool 2>/dev/null | head -1)
-		if [[ -z "$BPFTOOL" ]]; then
-			echo "bpftool not found. Please install it: sudo apt-get install linux-tools-common"
+if [[ ! -f "$BPF_DIR/snapshot_fault_ops.bpf.o" ]]; then
+	for tool in bpftool clang; do
+		if ! command -v "$tool" &>/dev/null; then
+			echo "$tool not found; it is required to compile the BPF object."
 			exit 1
 		fi
-	fi
+	done
 
-	# Locate libbpf headers; install libbpf-dev if missing.
-	BPF_INCLUDE=$(find /usr/include /usr/local/include \
-			-path "*/bpf/bpf_helpers.h" 2>/dev/null | head -1)
-	if [[ -z "$BPF_INCLUDE" ]]; then
-		echo "Installing libbpf-dev..."
-		sudo apt-get install -y libbpf-dev
-		BPF_INCLUDE=$(find /usr/include /usr/local/include \
-				-path "*/bpf/bpf_helpers.h" 2>/dev/null | head -1)
-	fi
-	BPF_INCLUDE="${BPF_INCLUDE%/bpf/bpf_helpers.h}"  # strip to parent include dir
-
-	# Map uname -m to the BPF arch define (matches build.rs logic).
+	echo "Compiling BPF fault-ops object..."
 	case "$(uname -m)" in
 		x86_64)  BPF_ARCH="__TARGET_ARCH_x86" ;;
 		aarch64) BPF_ARCH="__TARGET_ARCH_aarch64" ;;
 		*) echo "Unsupported architecture for BPF compilation: $(uname -m)"; exit 1 ;;
 	esac
 
-	# Generate vmlinux.h. Prefer the running kernel's BTF when the patched
-	# kernel is booted; otherwise fall back to the static vmlinux ELF so the
-	# object can be pre-built on a stock kernel. Dump to a file and grep that;
-	# a `dump | grep -q` pipeline is unreliable under pipefail (grep's early
-	# exit SIGPIPEs bpftool), and the successful dump doubles as the header.
-	echo "Generating vmlinux.h..."
-	if [[ -f "$KERNEL_BTF" ]] \
-			&& $BPFTOOL btf dump file "$KERNEL_BTF" format c > "$VMLINUX_H.tmp" 2>/dev/null \
-			&& grep -q "bpf_fault_ops_ctx" "$VMLINUX_H.tmp"; then
-		echo "Using running patched kernel BTF: $KERNEL_BTF"
-	elif [[ -n "$BPF_VMLINUX" && -f "$BPF_VMLINUX" ]] \
-			&& $BPFTOOL btf dump file "$BPF_VMLINUX" format c > "$VMLINUX_H.tmp" \
-			&& grep -q "bpf_fault_ops_ctx" "$VMLINUX_H.tmp"; then
-		echo "Using static patched kernel BTF: $BPF_VMLINUX"
-	else
-		rm -f "$VMLINUX_H.tmp"
-		echo "No BTF source with bpf_fault types found."
-		echo "Boot the bpf-fault kernel or set BPF_VMLINUX=/path/to/vmlinux."
-		exit 1
-	fi
-	mv "$VMLINUX_H.tmp" "$VMLINUX_H"
-
-	echo "Compiling BPF program (arch=$BPF_ARCH)..."
-	clang -O2 -g -target bpf \
-		"-D$BPF_ARCH" \
-		"-I$BPF_INCLUDE" \
-		"-I$BPF_DIR" \
-		-c "$BPF_SRC" -o "$BPF_OBJ"
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$BPF_DIR/vmlinux.h"
+	clang -O2 -g -target bpf "-D$BPF_ARCH" -I/usr/local/include -I"$BPF_DIR" \
+		-c "$BPF_DIR/snapshot_fault_ops.bpf.c" -o "$BPF_DIR/snapshot_fault_ops.bpf.o"
 fi
 
 # Build Firecracker release
@@ -190,6 +146,11 @@ else
 	fi
 fi
 ARTIFACTS_DIR=$(dirname "$EXT4")
+
+# Artifacts (including the SSH keys) are written root-owned by the container;
+# chown them back so they are usable without sudo. fix_perms exits non-zero when
+# a default target (e.g. test_results) doesn't exist yet.
+./tools/devtool fix_perms || true
 
 BASE_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04.ext4"
 APP_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04-app.ext4"
@@ -361,7 +322,7 @@ if $NO_SMOKE; then
 	echo "Skipping smoke test (--no-smoke-test)."
 else
 	echo "Running quick synthetic smoke test (all 3 modes, 512 MiB, no app rootfs needed)..."
-	sudo ./tools/devtool -y test -- \
+	./tools/devtool -y test -- \
 		-k "test_snapshot_experiment_quick" \
 		integration_tests/functional/test_snapshot_live_experiment.py \
 		-s --log-cli-level=INFO -m ""
@@ -371,15 +332,9 @@ fi
 echo ""
 echo "Setup complete. App rootfs: $APP_ROOTFS"
 echo ""
-echo "Run a quick experiment (single workload, 1 iteration):"
+echo "To run a quick experiment (single workload, 1 iteration):"
 echo ""
 echo "  python3 tests/integration_tests/functional/run_snapshot_benchmark.py \\"
-echo "    --workload redis_light \\"
+echo "    --workload redis_heavy \\"
 echo "    --mem-sizes 2048 \\"
 echo "    --iterations 1"
-echo ""
-echo "Run the full benchmark (all workloads, all mem sizes, 3 iterations each):"
-echo ""
-echo "  for wl in redis_light redis_mixed redis_heavy memcached_light memcached_heavy stream; do"
-echo "    python3 tests/integration_tests/functional/run_snapshot_benchmark.py --workload \"\$wl\""
-echo "  done"
