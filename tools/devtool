@@ -335,6 +335,17 @@ run_devctr() {
         fi
     done
 
+    # When this repo is a git submodule, .git is a pointer file and the real
+    # git directory lives in the superproject, outside the repo mount. Mount
+    # it at the container path the pointer resolves to so git works inside.
+    # For a regular clone .git is a directory and travels with the repo mount.
+    local gitdir_mount=()
+    if [ -f "$FC_ROOT_DIR/.git" ]; then
+        local host_gitdir=$(git -C "$FC_ROOT_DIR" rev-parse --absolute-git-dir)
+        local ctr_gitdir=$(realpath -m "$CTR_FC_ROOT_DIR/$(sed 's/^gitdir: //' "$FC_ROOT_DIR/.git")")
+        gitdir_mount=(--volume "$host_gitdir:$ctr_gitdir:z")
+    fi
+
     # Finally, run the dev container
     # Use 'z' on the --volume parameter for docker to automatically relabel the
     # content and allow sharing between containers.
@@ -351,6 +362,7 @@ run_devctr() {
         ${EXPERIMENT_ROOTFS:+--env EXPERIMENT_ROOTFS="$EXPERIMENT_ROOTFS"} \
         ${APP_ITERATIONS:+--env APP_ITERATIONS="$APP_ITERATIONS"} \
         $([ -x /usr/local/bin/memtier_benchmark ] && echo "--volume /usr/local/bin/memtier_benchmark:/usr/local/bin/memtier_benchmark:ro --volume /lib/x86_64-linux-gnu/libevent-2.1.so.7:/lib/x86_64-linux-gnu/libevent-2.1.so.7:ro --volume /lib/x86_64-linux-gnu/libevent_openssl-2.1.so.7:/lib/x86_64-linux-gnu/libevent_openssl-2.1.so.7:ro") \
+        "${gitdir_mount[@]}" \
         "$DEVCTR_IMAGE" "${ctr_args[@]}"
 }
 
