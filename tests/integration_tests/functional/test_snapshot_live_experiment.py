@@ -20,7 +20,6 @@ import pytest
 
 from .experiment import (
     APP_ITERATIONS,
-    APP_MEM_SIZES,
     MEMORY_FILL_FRACTION,
     VCPU_COUNT,
     _boot_app_experiment_vm,
@@ -30,12 +29,9 @@ from .experiment import (
     _log_app_summary,
     _log_summary,
     _run_full_snapshot,
-    _run_full_snapshot_app,
     _run_live_bpf_snapshot,
-    _run_live_bpf_snapshot_app,
     _run_live_snapshot,
     _run_live_snapshot_app,
-    _start_or_skip,
     _write_csv_row,
 )
 from .experiment.timeseries import (
@@ -255,85 +251,10 @@ def test_snapshot_experiment_quick(
             logger.warning("redis smoke test failed (non-fatal): %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Parametrized experiment tests — application workloads
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.nonci
-@pytest.mark.timeout(900)
-@pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
-@pytest.mark.parametrize("workload", [
-    "redis_light", "redis_mixed", "redis_heavy",
-    "memcached_light", "memcached_heavy", "stream",
-])
-@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
-def test_full_snapshot_app_experiment(
-    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
-):
-    """Collect full-snapshot metrics under Redis, Memcached, or STREAM workload."""
-    _start_or_skip(workload, mem_size_mib, "full", iteration)
-    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
-    _check_workload_tools(vm, workload)
-    row = _run_full_snapshot_app(vm, mem_size_mib, workload, iteration)
-    record_property("downtime_us", row.get("downtime_us", 0))
-    record_property("full_throughput_mibs", row.get("full_throughput_mibs", 0))
-    record_property("restore_api_ms", row.get("restore_api_ms", 0))
-    _write_csv_row(row)
-    _log_app_summary(row)
-
-
-@pytest.mark.nonci
-@pytest.mark.timeout(900)
-@pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
-@pytest.mark.parametrize("workload", [
-    "redis_light", "redis_mixed", "redis_heavy",
-    "memcached_light", "memcached_heavy", "stream",
-])
-@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
-def test_live_snapshot_app_experiment(
-    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
-):
-    """Collect live-snapshot metrics under Redis, Memcached, or STREAM workload."""
-    _start_or_skip(workload, mem_size_mib, "live", iteration)
-    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
-    _check_workload_tools(vm, workload)
-    row = _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
-    record_property("downtime_us", row.get("downtime_us", 0))
-    record_property("throughput_mibs", row.get("throughput_mibs", 0))
-    record_property("fault_fraction_pct", row.get("fault_fraction_pct", 0))
-    record_property("restore_api_ms", row.get("restore_api_ms", 0))
-    _write_csv_row(row)
-    _log_app_summary(row)
-
-
-@pytest.mark.nonci
-@pytest.mark.timeout(900)
-@pytest.mark.parametrize("mem_size_mib", APP_MEM_SIZES)
-@pytest.mark.parametrize(
-    "workload",
-    [
-        "redis_light",
-        "redis_mixed",
-        "redis_heavy",
-        "memcached_light",
-        "memcached_heavy",
-        "stream",
-    ],
-)
-@pytest.mark.parametrize("iteration", range(APP_ITERATIONS))
-def test_live_bpf_snapshot_app_experiment(
-    uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
-):
-    """Collect live-bpf-snapshot metrics under Redis, Memcached, and STREAM workloads."""
-    _start_or_skip(workload, mem_size_mib, "live_bpf", iteration)
-    vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib, bpf=True)
-    _check_workload_tools(vm, workload)
-    row = _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
-    record_property("downtime_us", row.get("downtime_us", 0))
-    record_property("throughput_mibs", row.get("throughput_mibs", 0))
-    _write_csv_row(row)
-    _log_app_summary(row)
+# The parametrized application-workload experiments (redis/memcached/
+# stream × mem size × snapshot mode) are run by the standalone benchmark
+# runner, tests/bench/run_snapshot_bench.py, not by pytest — see
+# `./tools/devtool bench`.
 
 
 # ---------------------------------------------------------------------------
