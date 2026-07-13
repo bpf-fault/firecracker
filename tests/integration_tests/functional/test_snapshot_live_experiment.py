@@ -35,6 +35,7 @@ from .experiment import (
     _run_live_bpf_snapshot_app,
     _run_live_snapshot,
     _run_live_snapshot_app,
+    _start_or_skip,
     _write_csv_row,
 )
 from .experiment.timeseries import (
@@ -271,6 +272,7 @@ def test_full_snapshot_app_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
     """Collect full-snapshot metrics under Redis, Memcached, or STREAM workload."""
+    _start_or_skip(workload, mem_size_mib, "full", iteration)
     vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
     _check_workload_tools(vm, workload)
     row = _run_full_snapshot_app(vm, mem_size_mib, workload, iteration)
@@ -293,6 +295,7 @@ def test_live_snapshot_app_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
     """Collect live-snapshot metrics under Redis, Memcached, or STREAM workload."""
+    _start_or_skip(workload, mem_size_mib, "live", iteration)
     vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib)
     _check_workload_tools(vm, workload)
     row = _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)
@@ -323,6 +326,7 @@ def test_live_bpf_snapshot_app_experiment(
     uvm_plain, microvm_factory, mem_size_mib, workload, iteration, record_property
 ):
     """Collect live-bpf-snapshot metrics under Redis, Memcached, and STREAM workloads."""
+    _start_or_skip(workload, mem_size_mib, "live_bpf", iteration)
     vm = _boot_app_experiment_vm(uvm_plain, microvm_factory, mem_size_mib, bpf=True)
     _check_workload_tools(vm, workload)
     row = _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteration)

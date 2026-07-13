@@ -6,6 +6,8 @@ import csv
 import logging
 import os
 
+import pytest
+
 from .constants import CSV_FIELDS, RESULTS_FILE
 from .workloads import _is_memcached_workload, _is_redis_workload, _is_stream_workload
 
@@ -118,6 +120,40 @@ def _log_app_summary(row):
         "  Mem file size:          %s bytes", row.get("mem_file_bytes", "?")
     )
     logger.info("=" * 70)
+
+
+def _existing_configs():
+    """Set of (workload, snapshot_mode, mem_size_mib, iteration) rows
+    already present in the experiment CSV."""
+    configs = set()
+    if not os.path.isfile(RESULTS_FILE):
+        return configs
+    with open(RESULTS_FILE, newline="") as f:
+        for row in csv.DictReader(f):
+            # A row whose timeseries file is gone is incomplete data:
+            # treat it as missing so the configuration reruns.
+            ts_rel = row.get("timeseries_file") or ""
+            if ts_rel and not os.path.exists(
+                    os.path.join(os.path.dirname(RESULTS_FILE), ts_rel)):
+                continue
+            try:
+                configs.add((row["workload"], row["snapshot_mode"],
+                             int(row["mem_size_mib"]), int(row["iteration"])))
+            except (KeyError, ValueError, TypeError):
+                continue
+    return configs
+
+
+def _start_or_skip(workload, mem_size_mib, mode, iteration):
+    """Announce the configuration about to run, or skip it when its
+    results are already in the CSV (EXPERIMENT_REUSE=0 disables reuse)."""
+    if os.environ.get("EXPERIMENT_REUSE", "1") != "0" and (
+            workload, mode, mem_size_mib, iteration) in _existing_configs():
+        print(f"Skipping {workload} {mode} mem={mem_size_mib} "
+              f"iteration={iteration} (already in results)", flush=True)
+        pytest.skip("already in results")
+    print(f"Running config: {workload} {mode} mem={mem_size_mib} "
+          f"iteration={iteration}", flush=True)
 
 
 def _write_csv_row(row):

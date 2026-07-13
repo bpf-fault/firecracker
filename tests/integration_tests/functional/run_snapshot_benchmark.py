@@ -54,16 +54,54 @@ _DEFAULT_ROOTFS    = "/srv/test_artifacts/ubuntu-24.04-app.ext4"
 # Phase 1 — run experiment
 # ---------------------------------------------------------------------------
 
-def run_experiment(workload: str, mem_sizes: list[int], iterations: int, rootfs: str):
-    """Run devtool test for each snapshot mode, filtering by workload."""
+def _existing_configs(workload: str) -> set:
+    """(mode, mem, iteration) combinations already in the CSV."""
+    configs = set()
+    if not os.path.exists(_RESULTS_CSV):
+        return configs
+    with open(_RESULTS_CSV, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("workload") != workload:
+                continue
+            # A row whose timeseries file is gone is incomplete data:
+            # treat it as missing so the configuration reruns.
+            ts_rel = row.get("timeseries_file") or ""
+            if ts_rel and not os.path.exists(
+                    os.path.join(_REPO_ROOT, "test_results", ts_rel)):
+                continue
+            try:
+                configs.add((row.get("snapshot_mode"),
+                             int(row["mem_size_mib"]),
+                             int(row.get("iteration") or 0)))
+            except (KeyError, ValueError, TypeError):
+                continue
+    return configs
+
+
+def run_experiment(workload: str, mem_sizes: list[int], iterations: int,
+                   rootfs: str, reuse: bool = True):
+    """Run devtool test for each snapshot mode, filtering by workload.
+
+    With reuse (the default), configurations already present in the CSV
+    are skipped: complete modes never launch the test container, and
+    partial modes skip per-configuration inside pytest (EXPERIMENT_REUSE
+    is forwarded into the container by devtool)."""
     mem_filter = " or ".join(str(m) for m in mem_sizes)
     env = {
         **os.environ,
         "EXPERIMENT_ROOTFS": rootfs,
         "APP_ITERATIONS":    str(iterations),
+        "EXPERIMENT_REUSE":  "1" if reuse else "0",
     }
+    existing = _existing_configs(workload) if reuse else set()
 
     for mode, test_fn in _MODE_TO_TEST.items():
+        grid = [(mem, it) for mem in mem_sizes for it in range(iterations)]
+        if all((mode, mem, it) in existing for mem, it in grid):
+            for mem, it in grid:
+                print(f"Skipping {workload} {mode} mem={mem} "
+                      f"iteration={it} (already in results)", flush=True)
+            continue
         # Pin the PCI fixture parametrization to one variant: the
         # experiment VMs are built fresh from EXPERIMENT_ROOTFS without a
         # pci argument, so PCI_ON and PCI_OFF run identical VMs and the
@@ -204,6 +242,16 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
         if key not in seen:
             seen[key] = row
 
+    expected = {(mode, mem, it) for mode in _MODE_TO_TEST
+                for mem in mem_sizes for it in range(max_iteration + 1)}
+    missing = sorted(expected - set(seen.keys()))
+    if missing:
+        print(f"ERROR: {len(missing)} configuration(s) missing from "
+              f"{_RESULTS_CSV} for workload {workload}:", file=sys.stderr)
+        for mode, mem, it in missing:
+            print(f"  {mode} mem={mem} iteration={it}", file=sys.stderr)
+        sys.exit(1)
+
     records = []
     for row in seen.values():
         mode      = row.get("snapshot_mode", "")
@@ -277,7 +325,11 @@ def export_results(workload: str, mem_sizes: list[int], bench_dir: str,
                 # relative path within bench results dir
                 ts_dest = f"timeseries/{basename}"
             else:
-                print(f"  WARNING: timeseries not found: {src}", file=sys.stderr)
+                print(f"ERROR: timeseries not found: {src}\n"
+                      "The canonical data in test_results/ is incomplete; "
+                      "rerun the experiment (reuse will redo only the "
+                      "affected configurations).", file=sys.stderr)
+                sys.exit(1)
 
         # ── freeze-window stats (phases 2-4, after prepare) ─────────────
         ts_freeze_start = _flt(row.get("ts_freeze_start_s"))
@@ -382,10 +434,14 @@ def main():
                          "default: --iterations - 1")
     ap.add_argument("--keep-artifacts", action="store_true",
                     help="Keep per-test pytest artifact directories after a successful run")
+    ap.add_argument("--no-reuse-results", action="store_true",
+                    help="Rerun everything instead of skipping "
+                         "configurations already present in the CSV")
     args = ap.parse_args()
 
     if not args.skip_run:
-        run_experiment(args.workload, args.mem_sizes, args.iterations, args.rootfs)
+        run_experiment(args.workload, args.mem_sizes, args.iterations,
+                       args.rootfs, reuse=not args.no_reuse_results)
 
     max_iteration = (args.max_iteration if args.max_iteration is not None
                      else args.iterations - 1)
