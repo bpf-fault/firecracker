@@ -377,8 +377,9 @@ def main():
                     help="Path to bpf-fault bench directory")
     ap.add_argument("--skip-run",      action="store_true",
                     help="Skip pytest; re-export from existing test_results/")
-    ap.add_argument("--max-iteration", type=int, default=2,
-                    help="Only include iterations 0..N (inclusive)")
+    ap.add_argument("--max-iteration", type=int, default=None,
+                    help="Only export iterations 0..N (inclusive); "
+                         "default: --iterations - 1")
     ap.add_argument("--keep-artifacts", action="store_true",
                     help="Keep per-test pytest artifact directories after a successful run")
     args = ap.parse_args()
@@ -386,8 +387,10 @@ def main():
     if not args.skip_run:
         run_experiment(args.workload, args.mem_sizes, args.iterations, args.rootfs)
 
+    max_iteration = (args.max_iteration if args.max_iteration is not None
+                     else args.iterations - 1)
     export_results(args.workload, args.mem_sizes, args.bench_dir,
-                   max_iteration=args.max_iteration)
+                   max_iteration=max_iteration)
 
     if not args.skip_run and not args.keep_artifacts:
         cleanup_test_artifacts()
