@@ -185,28 +185,18 @@ EXPERIMENT_ROOTFS=/srv/test_artifacts/ubuntu-24.04-app.ext4 \
 
 ## 5. Generating plots and analysis
 
-Use `run_snapshot_benchmark.py` to run tests and export results, then
-`plot_snapshot_benchmark.py` (in the bpf-fault bench repo) to produce figures.
-See `docs/snapshot-benchmark-runbook.md` for the full option reference.
+The application-workload sweep is driven by the standalone benchmark runner,
+not pytest. See `docs/snapshot-benchmark-runbook.md` for the full option
+reference.
 
 ```bash
-# Run one workload and export to bpf-fault bench repo
-python3 tests/integration_tests/functional/run_snapshot_benchmark.py \
-    --workload redis_heavy \
-    --bench-dir /mydata/bpf-fault/bench
-
-# Plot (from inside the bench repo)
-cd /mydata/bpf-fault/bench
-python3 plot_snapshot_benchmark.py results/snapshot_benchmark_redis_heavy.json \
-    --outdir fc_redis_heavy_figures
+# Run one workload into a host-side results store
+EXPERIMENT_RESULTS_DIR=/path/to/results ./tools/devtool -y bench -- \
+    --workloads redis_heavy --results-dir /bench_results
 ```
 
-Key output figures:
-
-| File | Content |
-|------|---------|
-| `timeseries_<mem>mib_<mode>.png` | Throughput + latency over time with snapshot markers |
-| `throughput_during_snapshot.png` | Baseline vs live vs live_bpf throughput during phases 2–4 |
+The results store (JSON records plus timeseries CSVs) is self-contained and
+consumable by any downstream plotting tooling.
 | `tail_latency_comparison.png` | p99 latency during phases 2–4 per memory size |
 | `downtime_comparison.csv` | Full vs live vs live_bpf downtime, mean ± std |
 
