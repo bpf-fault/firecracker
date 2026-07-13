@@ -63,6 +63,14 @@ if ! command -v docker &>/dev/null; then
 	sudo apt-get install -y docker.io
 fi
 
+# Record the docker group membership even when this session can already
+# reach the socket (in which case the re-exec below never triggers);
+# future login shells need the membership either way.
+if ! id -nG "$USER" | grep -qw docker; then
+	echo "Adding $USER to the docker group..."
+	sudo usermod -aG docker "$USER"
+fi
+
 # Re-exec the script under the docker group so a fresh membership takes
 # effect. Guarded so a non-permission failure (e.g. daemon not running)
 # can't re-exec in an infinite loop. timeout: with socket activation, a
@@ -74,8 +82,6 @@ if ! timeout 10 docker ps &>/dev/null; then
 		echo "Check the daemon: systemctl status docker"
 		exit 1
 	fi
-	echo "Adding $USER to the docker group..."
-	sudo usermod -aG docker "$USER"
 	echo "Re-executing script under the docker group..."
 	exec sg docker -c "$(printf '%q ' env _SETUP_REEXECED=1 "$SCRIPT_PATH" "$@")"
 fi
