@@ -20,3 +20,4 @@ tags
 /resources/bpf/*.bpf.o
 /resources/bpf/vmlinux.h
 .*
+env.list
