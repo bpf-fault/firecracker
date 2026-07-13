@@ -65,7 +65,11 @@ def run_experiment(workload: str, mem_sizes: list[int], iterations: int, rootfs:
     }
 
     for mode, test_fn in _MODE_TO_TEST.items():
-        k_filter = f"({test_fn}) and ({workload}) and ({mem_filter})"
+        # Pin the PCI fixture parametrization to one variant: the
+        # experiment VMs are built fresh from EXPERIMENT_ROOTFS without a
+        # pci argument, so PCI_ON and PCI_OFF run identical VMs and the
+        # CSV export would keep only the later of the two anyway.
+        k_filter = f"({test_fn}) and ({workload}) and ({mem_filter}) and PCI_OFF"
         cmd = [
             "./tools/devtool", "-y", "test", "--",
             "-k", k_filter,
