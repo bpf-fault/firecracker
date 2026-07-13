@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run the Firecracker snapshot experiment and export results to the bpf-fault bench repo.
+"""Run the Firecracker snapshot experiment and export the results.
 
 Phases:
   1. Run pytest via devtool for each snapshot mode (unless --skip-run).
   2. Copy timeseries CSVs into <bench-dir>/results/timeseries/.
-  3. Emit a bpf-fault-compatible JSON index to
+  3. Emit a JSON index to
      <bench-dir>/results/snapshot_benchmark_<workload>.json.
 
 Usage:
@@ -14,12 +14,11 @@ Usage:
         --mem-sizes 2048 4096 8192 \\
         --iterations 3 \\
         --rootfs /srv/test_artifacts/ubuntu-24.04-app.ext4 \\
-        --bench-dir /mydata/bpf-fault/bench
+        --bench-dir /path/to/results/repo
 
     # Re-export only (use existing test_results/, skip pytest)
     python3 run_snapshot_benchmark.py \\
         --workload redis_light \\
-        --bench-dir /mydata/bpf-fault/bench \\
         --skip-run
 """
 
@@ -362,7 +361,7 @@ def cleanup_test_artifacts():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Run Firecracker snapshot benchmark and export to bpf-fault bench repo.",
+        description="Run the Firecracker snapshot benchmark and export the results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--workload",    default="redis_light",
@@ -373,8 +372,9 @@ def main():
                     help="Number of iterations per configuration")
     ap.add_argument("--rootfs",      default=_DEFAULT_ROOTFS,
                     help="Path to guest rootfs image")
-    ap.add_argument("--bench-dir",   default="/mydata/bpf-fault/bench",
-                    help="Path to bpf-fault bench directory")
+    ap.add_argument("--bench-dir", default=_REPO_ROOT,
+                    help="Directory to export into; results are written "
+                         "to <bench-dir>/results/")
     ap.add_argument("--skip-run",      action="store_true",
                     help="Skip pytest; re-export from existing test_results/")
     ap.add_argument("--max-iteration", type=int, default=None,
