@@ -63,13 +63,20 @@ fn main() {
 
     // ── Check prerequisites ──────────────────────────────────────────────
 
+    // Skipping compilation is only worth a warning when there is no
+    // pre-existing object to fall back to (the include_bytes! below
+    // would then fail).
     if !has_command("bpftool") {
-        println!("cargo::warning=bpftool not found; skipping BPF compilation (using pre-existing .bpf.o if available)");
+        if !bpf_obj.exists() {
+            println!("cargo::warning=bpftool not found and no pre-existing .bpf.o; BPF snapshot support cannot build");
+        }
         return;
     }
 
     if !has_command("clang") {
-        println!("cargo::warning=clang not found; skipping BPF compilation (using pre-existing .bpf.o if available)");
+        if !bpf_obj.exists() {
+            println!("cargo::warning=clang not found and no pre-existing .bpf.o; BPF snapshot support cannot build");
+        }
         return;
     }
 

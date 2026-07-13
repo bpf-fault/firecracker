@@ -520,8 +520,6 @@ impl StreamingTask for UffdStreamingTask {
 pub(crate) struct Phase1UffdResult {
     /// Pre-allocated memory backing file.
     pub mem_file: File,
-    /// Total guest memory size in bytes.
-    pub total_mem_size: u64,
     /// Userfaultfd with WP capability.
     pub uffd: Uffd,
 }
@@ -578,7 +576,6 @@ pub(crate) fn phase1_prepare_uffd(
 
     Ok(Phase1UffdResult {
         mem_file,
-        total_mem_size,
         uffd,
     })
 }

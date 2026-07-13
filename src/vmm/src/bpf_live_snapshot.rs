@@ -39,8 +39,6 @@ struct PageEntry {
     ptr: *const u8,
     /// File offset where this page should be written.
     file_offset: u64,
-    /// Size of this page.
-    size: usize,
     /// Index into the links vec for the bpf_fault link owning this page.
     link_index: usize,
 }
@@ -188,7 +186,7 @@ impl Drop for BpfLiveSnapshotGuard<'_> {
 // ── BPF object loading (libbpf-rs) ─────────────────────────────────────────
 
 /// Loaded BPF object holding the struct_ops map and ring buffer.
-struct BpfFaultObject {
+pub(crate) struct BpfFaultObject {
     /// The loaded libbpf object (owns all map/program fds).
     _obj: libbpf_rs::Object,
     /// struct_ops map fd (borrowed from `_obj`, used for link creation).
@@ -1032,8 +1030,6 @@ impl StreamingTask for BpfStreamingTask {
 pub(crate) struct Phase1BpfResult {
     /// Pre-allocated memory backing file.
     pub mem_file: File,
-    /// Total guest memory size in bytes.
-    pub total_mem_size: u64,
     /// Loaded BPF object (struct_ops + ring buffer fds).
     pub bpf_obj: BpfFaultObject,
     /// Ring buffer size in bytes.
@@ -1103,7 +1099,6 @@ pub(crate) fn phase1_prepare_bpf(
 
     Ok(Phase1BpfResult {
         mem_file,
-        total_mem_size,
         bpf_obj,
         ring_buf_size,
     })
@@ -1222,12 +1217,10 @@ pub(crate) fn phase2_freeze_bpf(
                     let link_index = sr.link_index;
                     slot_range_cursor += 1;
                     for off in (0..slot_len).step_by(page_size) {
-                        let actual_size = std::cmp::min(page_size, slot_len - off);
                         pages.push(PageEntry {
                             // SAFETY: base_ptr + off is within the guest memory slot.
                             ptr: unsafe { base_ptr.add(off) },
                             file_offset: file_offset + off as u64,
-                            size: actual_size,
                             link_index,
                         });
                     }

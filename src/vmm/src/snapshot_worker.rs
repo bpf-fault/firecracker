@@ -63,6 +63,7 @@ pub struct SnapshotTimings {
 /// A full snapshot job submitted from the VMM thread.
 ///
 /// Contains everything the worker needs to execute Phases 1–4 independently.
+#[derive(Debug)]
 pub struct SnapshotJob {
     /// Handle to the VMM (locked briefly for Phase 2 only).
     pub vmm: Arc<Mutex<Vmm>>,
