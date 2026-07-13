@@ -403,7 +403,8 @@ def cleanup_test_artifacts():
     for name in _ARTIFACT_DIRS:
         path = os.path.join(test_results, name)
         if os.path.isdir(path):
-            shutil.rmtree(path)
+            # Best-effort: never fail the run over debug artifacts
+            shutil.rmtree(path, ignore_errors=True)
             print(f"Removed {path}")
 
 
