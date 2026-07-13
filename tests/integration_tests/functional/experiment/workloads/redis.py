@@ -40,9 +40,12 @@ def _setup_redis(vm, mem_size_mib, value_size=128):
         timeout=15,
     )
 
+    # Pipelining only speeds up the load; the op count, key distribution,
+    # and final dataset are unchanged.
     prefill_ops = redis_maxmem * 1024
     vm.ssh.check_output(
-        f"redis-benchmark -t set -n {prefill_ops} -d {value_size} -r 1000000 -q",
+        f"redis-benchmark -t set -n {prefill_ops} -d {value_size} -r 1000000 "
+        f"-P 16 -q",
         timeout=120,
     )
 

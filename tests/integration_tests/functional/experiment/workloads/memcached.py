@@ -70,11 +70,12 @@ def _setup_memcached(vm, mem_size_mib):
         timeout=20,
     )
 
+    # Pipelining only speeds up the load; the final dataset is unchanged.
     vm.ssh.check_output(
         "memtier_benchmark -s 127.0.0.1 -p 11211 --protocol=memcache_text "
         "--key-maximum=500000 --data-size=512 "
         "-c 10 -t 2 --ratio=1:0 -n allkeys --hide-histogram "
-        "--key-pattern=P:P",
+        "--key-pattern=P:P --pipeline=16",
         timeout=120,
     )
 
