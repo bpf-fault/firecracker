@@ -72,8 +72,10 @@ TIMESERIES_DIR = os.path.join(os.path.dirname(RESULTS_FILE), "timeseries")
 TIMESERIES_INTERVAL_S = 0.1
 
 # Per-window measurement durations (seconds).
-BASELINE_WINDOW_SEC = 10   # pre-snapshot steady-state window
-POST_WINDOW_SEC     = 10   # post-snapshot recovery window
+BASELINE_WINDOW_SEC = 5    # pre-snapshot steady-state window
+# Post-snapshot recovery window: the timeline figures only show up to
+# ~1.5 s past the snapshot end, so a short window suffices.
+POST_WINDOW_SEC     = 5
 
 CSV_FIELDS = [
     "timestamp",
