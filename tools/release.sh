@@ -135,6 +135,10 @@ fi
 # libbpf-sys vendors libelf/zlib from source. Building elfutils for musl needs
 # autotools + flex/bison/gawk, plus stubs for argp and obstack (glibc-only APIs
 # that elfutils configure checks for but libelf itself doesn't use).
+# Only needed when the vendored build actually recompiles: with a warm
+# cargo cache the build succeeds without any of this, so it is installed
+# lazily on build failure (see the cargo build invocation below).
+install_libbpf_build_deps() {
 if ! command -v flex &>/dev/null; then
     say "Installing build tools for libbpf-sys vendored build..."
     apt-get update -qq && apt-get install -y -qq autoconf automake libtool autopoint flex bison gawk
@@ -289,10 +293,16 @@ HDREOF2
     cp "$STUB_DIR/argp.h" "$STUB_DIR/obstack.h" "$MUSL_INC/"
     rm -rf "$STUB_DIR"
 fi
+}
 
 say "Building version=$VERSION, profile=$PROFILE, target=$CARGO_TARGET, Rust toolchain=${RUST_TOOLCHAIN}..."
 # shellcheck disable=SC2086
-cargo build --target "$CARGO_TARGET" $CARGO_OPTS --workspace --bins --examples
+if ! cargo build --target "$CARGO_TARGET" $CARGO_OPTS --workspace --bins --examples; then
+    say "Build failed; installing libbpf-sys build deps and retrying..."
+    install_libbpf_build_deps
+    # shellcheck disable=SC2086
+    cargo build --target "$CARGO_TARGET" $CARGO_OPTS --workspace --bins --examples
+fi
 
 # Only strip in release mode
 if [ "$PROFILE" = "release" ]; then
