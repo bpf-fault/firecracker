@@ -490,6 +490,11 @@ cmd_help() {
     test_debug [-- [<pytest args>]]
         Run tests in a debugging environment
 
+    bench [-- [<benchmark args>]]
+        Run the snapshot benchmark (tests/bench/run_snapshot_bench.py) in
+        the test container. When EXPERIMENT_RESULTS_DIR is set, it is
+        mounted at /bench_results for use as the results store.
+
     sandbox
         Run Firecracker in an IPython REPL (in devctr)
 
@@ -865,6 +870,67 @@ unapply_performance_tweaks() {
 
   # We do not reset the governor, as keeping track of each CPUs configured governor is not trivial here. On our CI
   # instances, the performance governor is current the default anyway (2023/11/14)
+}
+
+
+# `$0 bench` - run the snapshot benchmark (no pytest)
+# Please see `$0 help` for more information.
+#
+cmd_bench() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            "-h"|"--help")      { cmd_help; exit 1; } ;;
+            "--")               { shift; break;     } ;;
+            *)
+                die "Unknown argument: $1. Please use --help for help."
+            ;;
+        esac
+        shift
+    done
+
+    # Check prerequisites
+    ensure_kvm
+    ensure_devctr
+    ensure_build_dir
+    cmd_ensure_current_artifacts
+    cmd_build --release
+
+    apply_linux_61_tweaks
+    apply_amd_avic_tweaks
+
+    say "Kernel version: $(uname -r)"
+
+    env |grep -P "^(AWS_EMF_|BUILDKITE|CODECOV_|EXPERIMENT_)" > env.list
+
+    say "Starting benchmark run ..."
+
+    # Same privileged container environment as `test` (jailer needs
+    # cgroups/netns manipulation); mount the results store when the
+    # caller provides one.
+    run_devctr \
+        --privileged \
+        --security-opt seccomp=unconfined \
+        --ulimit core=0 \
+        --ulimit nofile=4096:4096 \
+        --ulimit memlock=-1:-1 \
+        --workdir "$CTR_FC_ROOT_DIR" \
+        ${EXPERIMENT_RESULTS_DIR:+--volume "$EXPERIMENT_RESULTS_DIR:/bench_results:z"} \
+        --env-file env.list \
+        -- \
+        ./tools/bench.sh "$@"
+
+    ret=$?
+
+    say "Finished benchmark run ..."
+
+    # Running as root would have created some root-owned files under the build
+    # dir. Let's fix that.
+    cmd_fix_perms
+
+    # do not leave behind env.list file
+    rm -f env.list
+
+    return $ret
 }
 
 
