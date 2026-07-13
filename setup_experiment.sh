@@ -47,7 +47,9 @@ for arg in "$@"; do
 done
 
 # devtool uses the host AWS CLI to sync test artifacts from S3
-if ! command -v aws &>/dev/null; then
+if command -v aws &>/dev/null; then
+	echo "Skipping AWS CLI install (already installed)."
+else
 	echo "Installing AWS CLI v2..."
 	curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
 	sudo apt-get update -qq
@@ -57,7 +59,9 @@ if ! command -v aws &>/dev/null; then
 	cd "$BASE_DIR"
 fi
 
-if ! command -v docker &>/dev/null; then
+if command -v docker &>/dev/null; then
+	echo "Skipping docker.io install (already installed)."
+else
 	echo "Installing docker.io..."
 	sudo apt-get update -qq
 	sudo apt-get install -y docker.io
@@ -87,7 +91,9 @@ if ! timeout 10 docker ps &>/dev/null; then
 fi
 
 # Firecracker (and the KVM check in devtool test) needs rw access to /dev/kvm.
-if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+	echo "Skipping /dev/kvm ACL (already accessible)."
+else
 	echo "Granting $USER access to /dev/kvm..."
 	command -v setfacl &>/dev/null || sudo apt-get install -y acl
 	sudo setfacl -m "u:$USER:rw" /dev/kvm
@@ -98,6 +104,9 @@ fi
 # in-container compilation is silently skipped. bpftool, clang, and the
 # libbpf headers in /usr/local are installed by the kernel build.
 BPF_DIR="$BASE_DIR/resources/bpf"
+if [[ -f "$BPF_DIR/snapshot_fault_ops.bpf.o" ]]; then
+	echo "Skipping BPF fault-ops compile (object already built)."
+fi
 if [[ ! -f "$BPF_DIR/snapshot_fault_ops.bpf.o" ]]; then
 	for tool in bpftool clang; do
 		if ! command -v "$tool" &>/dev/null; then
@@ -137,7 +146,7 @@ fi
 # sudo before re-running, otherwise devtool skips the conversion step.
 EXT4=$(find build/artifacts -name "ubuntu-24.04.ext4" 2>/dev/null | head -1 || true)
 if [[ -n "$EXT4" ]]; then
-	echo "Artifacts already set up at: $(dirname "$EXT4")"
+	echo "Skipping artifact download (already set up at: $(dirname "$EXT4"))."
 else
 	if [[ -d build/artifacts ]]; then
 		echo "Removing incomplete artifact directory..."
@@ -165,6 +174,7 @@ APP_ROOTFS="$ARTIFACTS_DIR/ubuntu-24.04-app.ext4"
 if $SKIP_MEMTIER; then
 	echo "Skipping memtier_benchmark check (--skip-memtier)."
 else
+	echo "Checking memtier_benchmark for --stats-interval support..."
 	# --help exits non-zero by design, so don't pipe it directly into grep under pipefail.
 	help_output=$(memtier_benchmark --help 2>&1 || true)
 	if ! grep -q "stats-interval" <<<"$help_output"; then
@@ -338,9 +348,6 @@ fi
 echo ""
 echo "Setup complete. App rootfs: $APP_ROOTFS"
 echo ""
-echo "To run a quick experiment (single workload, 1 iteration):"
+echo "To run a quick benchmark (single workload, 1 iteration):"
 echo ""
-echo "  python3 tests/integration_tests/functional/run_snapshot_benchmark.py \\"
-echo "    --workload redis_heavy \\"
-echo "    --mem-sizes 2048 \\"
-echo "    --iterations 1"
+echo "  ./tools/devtool -y bench -- --workloads redis_heavy --mem-sizes 2048 --iterations 1"
