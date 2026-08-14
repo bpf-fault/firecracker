@@ -319,6 +319,9 @@ def main():
     ap.add_argument("--workloads", nargs="+",
                     default=["redis_heavy", "memcached_heavy"],
                     help="Workloads to run")
+    ap.add_argument("--modes", nargs="+", default=list(_MODE_RUNNERS),
+                    choices=list(_MODE_RUNNERS),
+                    help="Snapshot modes to run")
     ap.add_argument("--mem-sizes", type=int, nargs="+",
                     default=[4096, 8192], metavar="MiB",
                     help="VM memory sizes")
@@ -347,7 +350,7 @@ def main():
     for workload in args.workloads:
         records = [] if args.no_reuse_results \
             else load_records(args.results_dir, workload)
-        for mode in _MODE_RUNNERS:
+        for mode in args.modes:
             for mem in args.mem_sizes:
                 for iteration in range(args.iterations):
                     if config_done(records, args.results_dir, mode, mem,
