@@ -37,11 +37,17 @@ REDIS_WORKLOAD_PARAMS = {
     "redis_light": {"clients": 2,  "ops": "get",     "value_size": 128, "pipeline": 1},
     "redis_mixed": {"clients": 10, "ops": "set,get", "value_size": 128, "pipeline": 1},
     "redis_heavy": {"clients": 50, "ops": "set",     "value_size": 128, "pipeline": 1},
+    # Saturating variant: pipelining removes the request-round-trip
+    # ceiling (~95K ops/s at 50 sync connections), driving redis to its
+    # single-thread capacity so snapshot interference cannot hide in
+    # idle guest CPU.
+    "redis_sat":   {"clients": 50, "ops": "set",     "value_size": 128, "pipeline": 16},
 }
 
 MEMCACHED_WORKLOAD_PARAMS = {
     "memcached_light": {"clients": 2,  "ratio": "1:9"},  # 1 SET : 9 GETs
     "memcached_heavy": {"clients": 50, "ratio": "1:1"},  # equal SET/GET
+    "memcached_sat":   {"clients": 50, "ratio": "1:1", "pipeline": 16},
 }
 
 # STREAM_ARRAY_SIZES: doubles, targeting ~50% guest RAM across 3 arrays

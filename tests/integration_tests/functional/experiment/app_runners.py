@@ -26,6 +26,7 @@ from .constants import (
 )
 from .metrics import (
     _compute_overall_stats,
+    _get_cpu_seconds,
     _get_peak_rss_kib,
     _get_rss_kib,
     _parse_live_snapshot_log,
@@ -111,17 +112,22 @@ def _run_full_snapshot_app(vm, mem_size_mib, workload, iteration):
         protocol, params = _app_memtier_params(workload)
         duration = BASELINE_WINDOW_SEC + 5 + POST_WINDOW_SEC
         ts = _start_memtier(guest_ip, vm.netns.id, protocol, params, duration)
+        cpu_baseline_start = _get_cpu_seconds(pid)
         time.sleep(BASELINE_WINDOW_SEC)
 
     rx_drop_before, _ = _get_iface_dropped(vm)
 
     ts_snap_start = (time.monotonic() - ts["start_wall"]) if ts else 0.0
+    cpu_snap_start = _get_cpu_seconds(pid)
+    if ts:
+        row["baseline_cpu_s"] = round(cpu_snap_start - cpu_baseline_start, 3)
 
     if _is_stream_workload(workload):
         _start_stream_during_burst(vm)
 
     # Pause → snapshot → resume same VM.
     snapshot, timings = _do_full_snapshot_resume_timed(vm)
+    row["during_cpu_s"] = round(_get_cpu_seconds(pid) - cpu_snap_start, 3)
     row.update(timings)
     row["downtime_us"] = int(timings["full_total_ms"] * 1000)
     row["total_us"]    = int(timings["full_total_ms"] * 1000)
@@ -243,17 +249,22 @@ def _run_live_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iteratio
         protocol, params = _app_memtier_params(workload)
         duration = BASELINE_WINDOW_SEC + 60 + POST_WINDOW_SEC
         ts = _start_memtier(guest_ip, vm.netns.id, protocol, params, duration)
+        cpu_baseline_start = _get_cpu_seconds(pid)
         time.sleep(BASELINE_WINDOW_SEC)
 
     rx_drop_before, _ = _get_iface_dropped(vm)
 
     ts_snap_start = (time.monotonic() - ts["start_wall"]) if ts else 0.0
+    cpu_snap_start = _get_cpu_seconds(pid)
+    if ts:
+        row["baseline_cpu_s"] = round(cpu_snap_start - cpu_baseline_start, 3)
 
     assert vm.state == "Running"
     snapshot = vm.snapshot_live()
     assert vm.state == "Running"
 
     ts_snap_end = (time.monotonic() - ts["start_wall"]) if ts else 0.0
+    row["during_cpu_s"] = round(_get_cpu_seconds(pid) - cpu_snap_start, 3)
 
     row["rss_peak_kib"] = _get_peak_rss_kib(pid)
 
@@ -408,17 +419,22 @@ def _run_live_bpf_snapshot_app(vm, microvm_factory, mem_size_mib, workload, iter
         protocol, params = _app_memtier_params(workload)
         duration = BASELINE_WINDOW_SEC + 60 + POST_WINDOW_SEC
         ts = _start_memtier(guest_ip, vm.netns.id, protocol, params, duration)
+        cpu_baseline_start = _get_cpu_seconds(pid)
         time.sleep(BASELINE_WINDOW_SEC)
 
     rx_drop_before, _ = _get_iface_dropped(vm)
 
     ts_snap_start = (time.monotonic() - ts["start_wall"]) if ts else 0.0
+    cpu_snap_start = _get_cpu_seconds(pid)
+    if ts:
+        row["baseline_cpu_s"] = round(cpu_snap_start - cpu_baseline_start, 3)
 
     assert vm.state == "Running"
     snapshot = vm.snapshot_live_bpf()
     assert vm.state == "Running"
 
     ts_snap_end = (time.monotonic() - ts["start_wall"]) if ts else 0.0
+    row["during_cpu_s"] = round(_get_cpu_seconds(pid) - cpu_snap_start, 3)
 
     row["rss_peak_kib"] = _get_peak_rss_kib(pid)
 

@@ -40,7 +40,10 @@ from functional.experiment import (
     _run_live_bpf_snapshot_app,
     _run_live_snapshot_app,
 )
-from functional.experiment.constants import TIMESERIES_DIR
+from functional.experiment.constants import (
+    BASELINE_WINDOW_SEC,
+    TIMESERIES_DIR,
+)
 
 _REPO_ROOT = _TESTS_DIR.parent
 _DEFAULT_RESULTS_DIR = _REPO_ROOT / "test_results"
@@ -240,6 +243,19 @@ def row_to_record(row, workload, mode, mem, iteration, results_dir):
         ts_path, _flt(row.get("ts_freeze_start_s")),
         _flt(row.get("ts_snap_end_s")))
 
+    # VMM-process CPU (all threads) over the baseline window and the
+    # snapshot window, as utilization (CPU-seconds per wall second).
+    snap_wall = (_flt(row.get("ts_snap_end_s"))
+                 - _flt(row.get("ts_snap_start_s")))
+    cpu = {
+        "baseline_cpu_s": _flt(row.get("baseline_cpu_s")),
+        "during_cpu_s":   _flt(row.get("during_cpu_s")),
+        "baseline_util":  (_flt(row.get("baseline_cpu_s"))
+                          / BASELINE_WINDOW_SEC),
+        "during_util":    (_flt(row.get("during_cpu_s")) / snap_wall
+                           if snap_wall > 0 else 0.0),
+    }
+
     return {
         "config": {
             "name":         "firecracker_snapshot",
@@ -259,6 +275,7 @@ def row_to_record(row, workload, mode, mem, iteration, results_dir):
                 k: (int(v) if k == "sample_count" else round(v, 3))
                 for k, v in freeze_window.items()
             },
+            "cpu":                {k: round(v, 3) for k, v in cpu.items()},
             "timeseries_file":    ts_dest,
             "ts_snap_start_s":    _flt(row.get("ts_snap_start_s")),
             "ts_snap_end_s":      _flt(row.get("ts_snap_end_s")),

@@ -3,6 +3,7 @@
 """Metric parsing and statistics helpers for the snapshot live experiment."""
 
 import math
+import os
 import re
 import statistics
 from pathlib import Path
@@ -97,6 +98,22 @@ def _parse_live_snapshot_log(log_data):
         metrics["downtime_us"] = int(m.group(2))
 
     return metrics
+
+
+def _get_cpu_seconds(pid):
+    """Total CPU seconds (utime+stime) consumed by the process so far.
+
+    Sampled around the baseline and snapshot windows, the delta shows
+    where snapshot overhead lands: extra VMM CPU burn vs. longer wall
+    time."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text("utf-8")
+        # Fields after the comm field (which may contain spaces/parens).
+        fields = stat.rsplit(")", 1)[1].split()
+        utime, stime = int(fields[11]), int(fields[12])
+        return (utime + stime) / os.sysconf("SC_CLK_TCK")
+    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+        return 0.0
 
 
 def _get_rss_kib(pid):
